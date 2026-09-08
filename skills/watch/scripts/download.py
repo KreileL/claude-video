@@ -45,9 +45,14 @@ def _pick_subtitle(out_dir: Path) -> Path | None:
     candidates = sorted(out_dir.glob("video*.vtt"))
     if not candidates:
         return None
+    # Original-language captions beat YouTube's machine translation, so take an
+    # *-orig track first and only fall back to English.
+    original = [c for c in candidates if "-orig." in c.name]
+    if original:
+        return original[0]
     preferred = [
         c for c in candidates
-        if any(marker in c.name for marker in (".en.", ".en-US.", ".en-GB.", ".en-orig."))
+        if any(marker in c.name for marker in (".en.", ".en-US.", ".en-GB."))
     ]
     return preferred[0] if preferred else candidates[0]
 
@@ -75,7 +80,7 @@ def fetch_captions(url: str, out_dir: Path) -> dict:
         "--write-info-json",
         "--write-subs",
         "--write-auto-subs",
-        "--sub-langs", "en.*",
+        "--sub-langs", ".*-orig,en.*",
         "--sub-format", "vtt",
         "--convert-subs", "vtt",
         "--no-playlist",
@@ -132,7 +137,7 @@ def download_url(
         "--write-info-json",
         "--write-subs",
         "--write-auto-subs",
-        "--sub-langs", "en.*",
+        "--sub-langs", ".*-orig,en.*",
         "--sub-format", "vtt",
         "--convert-subs", "vtt",
         "--no-playlist",
