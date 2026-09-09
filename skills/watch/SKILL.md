@@ -223,11 +223,20 @@ Behavior:
 The script gets a timestamped transcript in one of two ways:
 
 1. **Native captions (free, preferred).** yt-dlp pulls manual or auto-generated subtitles from the source platform if available.
-2. **Whisper API fallback.** If no captions came back (or the source is a local file), the script extracts audio (`ffmpeg -vn -ac 1 -ar 16000 -b:a 64k`, ~0.5 MB/min) and uploads it to whichever Whisper API has a key configured:
-   - **Groq** — `whisper-large-v3`. Preferred default: cheaper, faster. Get a key at console.groq.com/keys.
-   - **OpenAI** — `whisper-1`. Fallback. Get a key at platform.openai.com/api-keys.
+2. **Whisper fallback.** If no captions came back (or the source is a local file), the script extracts audio (`ffmpeg -vn -ac 1 -ar 16000 -b:a 64k`, ~0.5 MB/min) and sends it to whichever backend is configured:
+   - **Local server** — any OpenAI-compatible speech-to-text server (speaches, faster-whisper-server, LM Studio, whisper.cpp's `whisper-server`). No key, no cost, and **the audio never leaves the machine**.
+   - **Groq** — `whisper-large-v3`. Preferred hosted default: cheaper, faster. Get a key at console.groq.com/keys.
+   - **OpenAI** — `whisper-1`. Hosted fallback. Get a key at platform.openai.com/api-keys.
 
-Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are set; override with `--whisper openai` to force OpenAI. Use `--no-whisper` to skip the fallback entirely.
+All of this lives in `~/.config/watch/.env`. Point at a local server by setting its `/v1` root:
+
+```bash
+WATCH_WHISPER_BASE_URL=http://localhost:8000/v1
+WATCH_WHISPER_MODEL=deepdml/faster-whisper-large-v3-turbo-ct2   # the server's own model id
+WATCH_WHISPER_MAX_UPLOAD_MB=2048                                # local has no 25 MB cap
+```
+
+A configured local server wins over a hosted key — it is free, private, and setting it is an explicit choice. Force a specific backend with `--whisper local|groq|openai`; the script otherwise prefers local, then Groq, then OpenAI. Use `--no-whisper` to skip the fallback entirely.
 
 ## Failure modes and handling
 
@@ -251,15 +260,16 @@ If you already watched a video this session and the user asks a follow-up, do **
 **What this skill does:**
 - Runs `yt-dlp` locally to download the video and pull native captions when the source supports them (public data; the request goes directly to whatever host the URL points at)
 - Runs `ffmpeg` / `ffprobe` locally to extract frames as JPEGs and, when Whisper is needed, a mono 16 kHz audio clip
-- Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set (preferred — cheaper, faster)
-- Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set and Groq is not, or when `--whisper openai` is forced
+- Sends the extracted audio clip to the host named in `WATCH_WHISPER_BASE_URL` when one is set — nothing leaves the machine if that host is local (this takes precedence over the hosted APIs below)
+- Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set and no local server is configured (preferred hosted option — cheaper, faster)
+- Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set and neither a local server nor Groq applies, or when `--whisper openai` is forced
 - Writes the downloaded video, frames, audio, and an intermediate transcript to a working directory under the system temp dir (or `--out-dir` if specified) so Claude can `Read` them
 - Reads / creates `~/.config/watch/.env` (mode `0600`) to store the Whisper API key(s) and a `SETUP_COMPLETE` marker. As a fallback, also reads `.env` in the current working directory
 
 **What this skill does NOT do:**
 - Does not upload the video itself to any API — only the extracted audio goes out, and only when native captions are missing AND Whisper is not disabled with `--no-whisper`
 - Does not access any platform account (no login, no session cookies, no posting) — yt-dlp only ever requests public data
-- Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`)
+- Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`). `OPENAI_API_KEY` is **never** forwarded to `WATCH_WHISPER_BASE_URL` — that URL can name any host; a server that wants auth reads `WATCH_WHISPER_API_KEY` instead
 - Does not log, cache, or write API keys to stdout, stderr, or output files
 - Does not persist anything outside the working directory and `~/.config/watch/.env` — clean up the working directory when you're done (Step 5)
 

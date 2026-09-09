@@ -36,6 +36,88 @@ OPENAI_MODEL = "whisper-1"
 # margin under that so multipart framing overhead never pushes a chunk over.
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
 
+# A local OpenAI-compatible server (speaches, faster-whisper-server, LM Studio,
+# whisper.cpp's whisper-server, …) speaks the same multipart protocol as the
+# hosted APIs, so pointing at one needs no new backend — only these overrides.
+# Set WATCH_WHISPER_BASE_URL to the server's /v1 root to switch.
+BASE_URL_KEY = "WATCH_WHISPER_BASE_URL"
+MODEL_KEY = "WATCH_WHISPER_MODEL"
+MAX_UPLOAD_KEY = "WATCH_WHISPER_MAX_UPLOAD_MB"
+# Deliberately separate from OPENAI_API_KEY: the base URL can point at any host,
+# so forwarding the real OpenAI credential there would leak it to a third party.
+API_KEY_KEY = "WATCH_WHISPER_API_KEY"
+
+
+def _dotenv_paths() -> list[Path]:
+    # Resolved per call, not at import: cwd can change between invocations.
+    return [Path.home() / ".config" / "watch" / ".env", Path.cwd() / ".env"]
+
+
+def _from_dotenv(path: Path, name: str) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            if key.strip() != name:
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] in ('"', "'") and value[-1] == value[0]:
+                value = value[1:-1]
+            return value or None
+    except OSError:
+        return None
+    return None
+
+
+def setting(name: str) -> str | None:
+    """Read a setting from the environment, falling back to the .env files."""
+    value = os.environ.get(name)
+    if value and value.strip():
+        return value.strip()
+    for path in _dotenv_paths():
+        value = _from_dotenv(path, name)
+        if value:
+            return value
+    return None
+
+
+def openai_endpoint() -> str:
+    """Transcription endpoint — the local base URL when one is configured."""
+    base = setting(BASE_URL_KEY)
+    if not base:
+        return OPENAI_ENDPOINT
+    return f"{base.rstrip('/')}/audio/transcriptions"
+
+
+def openai_model() -> str:
+    """Model id. Local servers use their own ids, not OpenAI's `whisper-1`."""
+    return setting(MODEL_KEY) or OPENAI_MODEL
+
+
+def max_upload_bytes() -> int:
+    """Upload cap. The 24 MB default exists only because the hosted APIs
+    enforce 25 MB; a local server has no such limit, so raising this avoids
+    pointless chunking (and the seam artifacts that come with it)."""
+    raw = setting(MAX_UPLOAD_KEY)
+    if not raw:
+        return MAX_UPLOAD_BYTES
+    try:
+        megabytes = float(raw)
+    except ValueError:
+        print(
+            f"[watch] ignoring invalid {MAX_UPLOAD_KEY}={raw!r} (want a number of MB)",
+            file=sys.stderr,
+        )
+        return MAX_UPLOAD_BYTES
+    if megabytes <= 0:
+        print(f"[watch] ignoring non-positive {MAX_UPLOAD_KEY}={raw!r}", file=sys.stderr)
+        return MAX_UPLOAD_BYTES
+    return int(megabytes * 1024 * 1024)
+
 
 def plan_chunks(
     total_seconds: float,
@@ -63,49 +145,30 @@ def plan_chunks(
 
 
 def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, None]:
-    """Return (backend, api_key). Prefers Groq, falls back to OpenAI.
+    """Return (backend, api_key). Prefers a local server, then Groq, then OpenAI.
 
-    If `preferred` is "groq" or "openai", only that backend's key is considered.
+    If `preferred` is "groq", "openai" or "local", only that backend is considered.
+
+    A configured local server outranks a hosted key: it costs nothing, keeps the
+    audio on the machine, and having set it is an explicit choice. `--whisper
+    groq` is the escape hatch when both are configured. Local servers generally
+    ignore Authorization, so a placeholder stands in for the key rather than
+    blocking on a credential that carries no meaning. OPENAI_API_KEY is never
+    reused here — the base URL can name any host, and the real credential must
+    not follow it there. A server that does want auth takes WATCH_WHISPER_API_KEY.
     """
-    def _from_env(name: str) -> str | None:
-        value = os.environ.get(name)
-        return value.strip() if value else None
-
-    def _from_dotenv(path: Path, name: str) -> str | None:
-        if not path.exists():
-            return None
-        try:
-            for line in path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                if key.strip() != name:
-                    continue
-                value = value.strip()
-                if len(value) >= 2 and value[0] in ('"', "'") and value[-1] == value[0]:
-                    value = value[1:-1]
-                return value or None
-        except OSError:
-            return None
-        return None
-
-    dotenv_paths = [
-        Path.home() / ".config" / "watch" / ".env",
-        Path.cwd() / ".env",
-    ]
+    local_base = setting(BASE_URL_KEY)
+    if local_base and preferred in (None, "local", "openai"):
+        return "local", setting(API_KEY_KEY) or "local"
+    if preferred == "local" and not local_base:
+        return None, None
 
     candidates = (("GROQ_API_KEY", "groq"), ("OPENAI_API_KEY", "openai"))
     if preferred is not None:
         candidates = tuple(c for c in candidates if c[1] == preferred)
 
     for key_name, backend in candidates:
-        value = _from_env(key_name)
-        if not value:
-            for candidate in dotenv_paths:
-                value = _from_dotenv(candidate, key_name)
-                if value:
-                    break
+        value = setting(key_name)
         if value:
             return backend, value
 
@@ -404,8 +467,10 @@ def _transcribe_file(backend: str, api_key: str, audio_path: Path) -> list[dict]
     """Upload one audio file and return its 0-based segments."""
     if backend == "groq":
         response = _post_whisper(GROQ_ENDPOINT, api_key, GROQ_MODEL, audio_path)
-    elif backend == "openai":
-        response = _post_whisper(OPENAI_ENDPOINT, api_key, OPENAI_MODEL, audio_path)
+    elif backend in ("openai", "local"):
+        # Identical wire protocol; only the endpoint and model id differ, and
+        # both resolve to the hosted defaults when no local server is set.
+        response = _post_whisper(openai_endpoint(), api_key, openai_model(), audio_path)
     else:
         raise SystemExit(f"Unknown whisper backend: {backend}")
     return _segments_from_response(response)
@@ -429,19 +494,21 @@ def transcribe_video(
     if not backend or not api_key:
         setup_py = Path(__file__).resolve().parent / "setup.py"
         raise SystemExit(
-            "No Whisper API key available. Set GROQ_API_KEY (preferred) or OPENAI_API_KEY "
-            "in the environment or in ~/.config/watch/.env. "
+            "No Whisper backend available. Set GROQ_API_KEY (preferred) or OPENAI_API_KEY "
+            f"in the environment or in ~/.config/watch/.env, or set {BASE_URL_KEY} to a "
+            "local OpenAI-compatible server (e.g. http://localhost:8000/v1). "
             f"Run `python3 {setup_py}` to configure."
         )
 
     print(f"[watch] extracting audio for Whisper ({backend})…", file=sys.stderr)
     audio_path = extract_audio(video_path, audio_out)
     audio_bytes = audio_path.stat().st_size
+    upload_cap = max_upload_bytes()
 
     def transcribe_one(path: Path) -> list[dict]:
         return _transcribe_file(backend, api_key, path)
 
-    if audio_bytes <= MAX_UPLOAD_BYTES:
+    if audio_bytes <= upload_cap:
         print(
             f"[watch] audio: {audio_bytes / 1024:.0f} kB — uploading to {backend} Whisper…",
             file=sys.stderr,
@@ -449,10 +516,10 @@ def transcribe_video(
         segments = transcribe_one(audio_path)
     else:
         duration = audio_duration(audio_path)
-        plan = plan_chunks(duration, audio_bytes, MAX_UPLOAD_BYTES)
+        plan = plan_chunks(duration, audio_bytes, upload_cap)
         print(
             f"[watch] audio: {audio_bytes / (1024 * 1024):.0f} MB exceeds "
-            f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB — splitting into {len(plan)} chunks…",
+            f"{upload_cap // (1024 * 1024)} MB — splitting into {len(plan)} chunks…",
             file=sys.stderr,
         )
         chunks = split_audio(audio_path, audio_out.parent / "chunks", plan)
@@ -467,7 +534,10 @@ def transcribe_video(
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("usage: whisper.py <video-path> [<audio-out.mp3>] [--backend groq|openai]", file=sys.stderr)
+        print(
+            "usage: whisper.py <video-path> [<audio-out.mp3>] [--backend groq|openai|local]",
+            file=sys.stderr,
+        )
         raise SystemExit(2)
 
     video = sys.argv[1]
