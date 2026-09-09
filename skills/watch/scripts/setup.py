@@ -86,7 +86,16 @@ _PERM_WARNED: set[str] = set()
 
 def _check_file_permissions(path: Path) -> None:
     """Warn to stderr (once per path per process) if a secrets file is
-    world/group readable."""
+    world/group readable.
+
+    POSIX only. Windows secures files with ACLs, and Python there synthesises
+    ``st_mode`` from the read-only attribute alone — a file locked down with
+    ``icacls`` still reports 0o666, so this check would fire on every run and
+    tell the user to run ``chmod``, which does nothing on Windows. An
+    unactionable warning on every invocation is worse than no warning.
+    """
+    if os.name == "nt":
+        return
     key = str(path)
     if key in _PERM_WARNED:
         return
