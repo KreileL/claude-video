@@ -203,7 +203,9 @@ At `transcript` detail, captions are enough to return a report without downloadi
 
 At `efficient` detail, the script downloads the video and extracts **keyframes only** (`ffmpeg -skip_frame nokey`) — a near-instant pass that lands frames on scene cuts. If a clip has fewer than 4 keyframes it falls back to uniform sampling.
 
-At `balanced` / `token-burner` detail, the script extracts **scene-aware** frames: ffmpeg scene-change selection first, falling back to uniform sampling only when the video is effectively static. `balanced` caps at 100 frames; `token-burner` is uncapped. Frame report lines include both timestamp and selection reason. Extracted images are clamped to a maximum 1998px height for Claude Read compatibility.
+At `balanced` / `token-burner` detail, the script extracts **scene-aware** frames: ffmpeg scene-change selection first, falling back to uniform sampling when the detected cuts are too few to cover the range — either under 8 shots (an effectively static clip) or under a quarter of the duration's frame budget (a long video whose few cuts would leave minutes unsampled). `balanced` caps at 100 frames; `token-burner` is uncapped.
+
+**`token-burner` removes the cap; it does not add density.** It returns whatever the selector found, so on footage that holds a single shot — a talking head, a lecture, an interview — it yields the same handful of frames a shorter video would, however long it runs. Reach for it when a video is visually busy and you suspect the 100-frame cap is truncating real scene changes. It is the wrong tool for thin coverage caused by there being little to see; use `--start`/`--end` to zoom in instead. The report warns whenever the achieved spacing exceeds ~15s per frame, in any mode. Frame report lines include both timestamp and selection reason. Extracted images are clamped to a maximum 1998px height for Claude Read compatibility.
 
 ## Transcript-cue frames
 

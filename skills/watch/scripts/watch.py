@@ -23,6 +23,12 @@ from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
 
 
+# Above this many seconds between frames, the gaps matter more than the frames.
+# The designed density is ~6s/frame (a 100-frame cap across a 10-minute clip),
+# so this threshold sits well past "merely coarse".
+SPARSE_SECONDS_PER_FRAME = 15.0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="watch",
@@ -384,15 +390,26 @@ def main() -> int:
             "This may use a large number of image tokens."
         )
 
-    if not focused and full_duration > 600 and detail not in ("transcript", "token-burner"):
-        mins = int(full_duration // 60)
-        print()
-        print(
-            f"> **Warning:** This is a {mins}-minute video. Frame coverage is sparse at this length "
-            f"under `{detail}` detail — its cap spreads thin across the full clip. For better results, "
-            "re-run with `--start HH:MM:SS --end HH:MM:SS` to zoom into a section, or use "
-            "`--detail token-burner` to keep every scene-change frame across the whole video."
-        )
+    # Warn on the coverage actually achieved, not on the detail mode. The old
+    # check keyed off duration and exempted token-burner, on the theory that an
+    # uncapped mode cannot be sparse. It can: uncapped only removes the ceiling,
+    # it does not make the selector find more. A talking-head video yields a
+    # handful of scene cuts however long it runs, so the one mode that stayed
+    # silent was the one that had gone blind — 17 frames across 11 minutes, with
+    # multi-minute gaps, and no warning at all.
+    if not focused and detail != "transcript" and frames and full_duration > 0:
+        seconds_per_frame = full_duration / len(frames)
+        if seconds_per_frame > SPARSE_SECONDS_PER_FRAME:
+            mins = int(full_duration // 60)
+            print()
+            print(
+                f"> **Warning:** {len(frames)} frames across {mins} minutes — roughly one every "
+                f"{seconds_per_frame:.0f}s, so stretches of this video were never sampled. "
+                "Treat any visual claim as unverified between frames. To fix, re-run with "
+                "`--start HH:MM:SS --end HH:MM:SS` to zoom into the part you care about. "
+                "`--detail token-burner` only helps when the video has more scene changes than "
+                "the cap allowed — it will not add frames to footage that simply holds one shot."
+            )
 
     print()
     print("## Frames")
