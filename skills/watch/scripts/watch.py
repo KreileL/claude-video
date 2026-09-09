@@ -7,6 +7,7 @@ then Reads each frame path to see the video.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -55,6 +56,16 @@ def main() -> int:
         help="Disable Whisper fallback. Report frames-only if no captions available.",
     )
     ap.add_argument(
+        "--force-whisper",
+        action="store_true",
+        help=(
+            "Transcribe with Whisper even when native captions exist. Worth it when "
+            "the platform's auto-captions are poor (no punctuation, mangled proper "
+            "nouns, rolling duplicates) and Whisper runs locally, so the only cost "
+            "is CPU time. Falls back to the captions if Whisper fails."
+        ),
+    )
+    ap.add_argument(
         "--whisper",
         choices=["groq", "openai", "local"],
         default=None,
@@ -70,6 +81,9 @@ def main() -> int:
              "frames (static screen recordings, held slides) instead of collapsing them.",
     )
     args = ap.parse_args()
+
+    if args.force_whisper and args.no_whisper:
+        raise SystemExit("--force-whisper and --no-whisper are mutually exclusive")
 
     config = get_config()
     detail = args.detail or str(config["detail"])
@@ -100,7 +114,9 @@ def main() -> int:
     if url_source:
         print("[watch] checking metadata/captions via yt-dlp…", file=sys.stderr)
         dl = fetch_captions(args.source, work / "download")
-        if dl.get("subtitle_path"):
+        # Captions are still fetched under --force-whisper: they cost nothing
+        # extra here and stand as the fallback if Whisper cannot deliver.
+        if dl.get("subtitle_path") and not args.force_whisper:
             try:
                 transcript_segments = parse_vtt(dl["subtitle_path"])
                 transcript_text = format_transcript(transcript_segments)
@@ -108,6 +124,11 @@ def main() -> int:
             except Exception as exc:
                 print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
                 transcript_segments = []
+        elif dl.get("subtitle_path"):
+            print(
+                "[watch] --force-whisper: native captions found but set aside",
+                file=sys.stderr,
+            )
 
     # --timestamps needs the video for frame grabs, so it overrides the
     # transcript-mode download skip (and forces a full, not audio-only, fetch).
@@ -230,7 +251,7 @@ def main() -> int:
     if cue_frames:
         frames = merge_frames(frames, cue_frames)
 
-    if not transcript_segments and dl.get("subtitle_path"):
+    if not transcript_segments and dl.get("subtitle_path") and not args.force_whisper:
         try:
             all_segments = parse_vtt(dl["subtitle_path"])
             transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
@@ -267,6 +288,43 @@ def main() -> int:
             )
     elif not transcript_segments and video_path and not meta.get("has_audio"):
         print("[watch] no audio stream found — proceeding without transcription", file=sys.stderr)
+
+    # --force-whisper set the captions aside on purpose. If Whisper then failed
+    # (backend down, no backend configured, audio unusable), captions are still
+    # a far better outcome than reporting no transcript at all.
+    if args.force_whisper and not transcript_segments and dl.get("subtitle_path"):
+        try:
+            all_segments = parse_vtt(dl["subtitle_path"])
+            transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
+            transcript_text = format_transcript(transcript_segments)
+            transcript_source = "captions (whisper unavailable)"
+            print("[watch] falling back to native captions", file=sys.stderr)
+        except Exception as exc:
+            print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
+
+    # Persist the transcript beside the frames. Whisper output is otherwise
+    # ephemeral — it exists only in this report — and re-deriving it costs a
+    # full transcription pass. The captions path leaves only yt-dlp's raw .vtt,
+    # which is neither range-filtered nor in our segment shape.
+    transcript_file: Path | None = None
+    if transcript_segments:
+        transcript_file = work / "transcript.json"
+        try:
+            transcript_file.write_text(
+                json.dumps(
+                    {
+                        "source": transcript_source,
+                        "range": {"start": effective_start, "end": effective_end} if focused else None,
+                        "segments": transcript_segments,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            print(f"[watch] could not write transcript.json: {exc}", file=sys.stderr)
+            transcript_file = None
 
     info = dl.get("info") or {}
 
@@ -364,6 +422,8 @@ def main() -> int:
             print(f"_Source: {label}. Filtered to {format_time(effective_start)} → {format_time(effective_end)}:_")
         else:
             print(f"_Source: {label}._")
+        if transcript_file:
+            print(f"_Saved to: `{transcript_file}`_")
         print()
         print("```")
         print(transcript_text)

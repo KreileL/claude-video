@@ -149,6 +149,7 @@ Optional flags:
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)
 - `--whisper groq|openai` — force a specific Whisper backend (default: prefer Groq if both keys exist)
 - `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions)
+- `--force-whisper` — transcribe with Whisper **even when native captions exist**. Reach for it when the platform's auto-captions are visibly poor: no punctuation, mangled proper nouns, or the rolling two-line format that repeats every line (YouTube auto-captions do all three). Only worth the wall-clock when Whisper is local — see "Transcription" below. Mutually exclusive with `--no-whisper`; falls back to the captions if Whisper fails, and the report says `captions (whisper unavailable)` when that happens.
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the previous kept one (held slides, static screen recordings, paused video) so the frame budget goes to distinct content; the report's **Frames** line notes how many were dropped. Pass this only if the user needs every sampled frame (e.g. judging subtle frame-to-frame motion).
 
 ### Focusing on a section (higher frame rate)
@@ -238,6 +239,8 @@ WATCH_WHISPER_MAX_UPLOAD_MB=2048                                # local has no 2
 
 A configured local server wins over a hosted key — it is free, private, and setting it is an explicit choice. Force a specific backend with `--whisper local|groq|openai`; the script otherwise prefers local, then Groq, then OpenAI. Use `--no-whisper` to skip the fallback entirely.
 
+**Captions vs Whisper.** Native captions are preferred by default because they are free and instant. That default was written for paid APIs, and it is worth revisiting per video: platform auto-captions are frequently much worse than Whisper — no punctuation, garbled proper nouns, and (on YouTube) a rolling two-line format that duplicates every line, which inflates the segment count and makes the transcript hard to quote. When the backend is a local server the only cost of doing better is CPU time, so `--force-whisper` is usually the right call on any video whose transcript you intend to quote or reason over closely. Manual (human-authored) captions are a different story — those normally beat Whisper, and the report's `Transcript` line does not distinguish them from auto-generated ones, so judge by the text itself.
+
 ## Failure modes and handling
 
 - **Setup preflight failed** → run `python3 "${SKILL_DIR}/scripts/setup.py"` (auto-installs ffmpeg/yt-dlp via brew on macOS, scaffolds the `.env`). For API key, ask the user via `AskUserQuestion` and write it to `~/.config/watch/.env`.
@@ -263,7 +266,7 @@ If you already watched a video this session and the user asks a follow-up, do **
 - Sends the extracted audio clip to the host named in `WATCH_WHISPER_BASE_URL` when one is set — nothing leaves the machine if that host is local (this takes precedence over the hosted APIs below)
 - Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set and no local server is configured (preferred hosted option — cheaper, faster)
 - Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set and neither a local server nor Groq applies, or when `--whisper openai` is forced
-- Writes the downloaded video, frames, audio, and an intermediate transcript to a working directory under the system temp dir (or `--out-dir` if specified) so Claude can `Read` them
+- Writes the downloaded video, frames (`frames/frame_NNNN.jpg`), audio, and the resolved transcript (`transcript.json` — source label, focus range, and the timestamped segments) to a working directory under the system temp dir (or `--out-dir` if specified) so Claude can `Read` them
 - Reads / creates `~/.config/watch/.env` (mode `0600`) to store the Whisper API key(s) and a `SETUP_COMPLETE` marker. As a fallback, also reads `.env` in the current working directory
 
 **What this skill does NOT do:**
