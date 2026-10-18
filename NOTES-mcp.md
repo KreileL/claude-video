@@ -742,3 +742,79 @@ Known limitations, accepted:
 3. Reinicie o Claude Desktop.
 
 Código da v1: tag `v1-mcp` (16dc2ed). Imagem: `watch-mcp:latest`, também marcada como `watch-mcp:v1` (600e77791f74).
+
+## v3 — Holocron notes, Telegram bot, Gemini summary (branch mcp-v3)
+
+### Rule zero (before anything else)
+
+- Backup `D:\BACKUP\watch-jobs\job-0ed8ff98.tar.gz` existed (28 MB, 2773 entries); `tar -tzf` opens it, and `index.json`, `job.json` and `transcript.json` inside have the same SHA-256 as the live job.
+- Job `0ed8ff98d31ffbe6207d47f6c56b46f4` (Devoradores_de_Estrelas.mkv, 2:36:22) set to `state: "archived"` (+ `archived: true`, `archived_at`, `archived_from: "done"`, `archived_reason`) with an atomic write, before any code change. The v2 cleanup only deletes `done`/`failed`, so this protects it under the running v2 worker and after any rollback; v2's `watch_video(job_id=…)`/`search_transcript` only refuse `failed`, so it stays readable. Checked by running v2's own `jobstore.cleanup` on a copy with TTL expired 30 days ago and cap 0: nothing removed.
+- Tests never touch `watch-mcp-jobs`: unit tests use tmp dirs; `tests/e2e/e2e_v3.py` refuses that volume name and uses `watch-mcp-v3test-jobs`.
+
+### Architecture
+
+- `watch-worker-v3` = the v2 worker + `postproc.py`. On `done`: summary (`resumo.py`) → stage the folder in `00 - Entrada/.watch-tmp/<job_id>` → one rename → `state: archived`. `process()` sets `export: "pendente"` together with `done`, so a crash before the post-processing still gets the note (`retry_due`, every 60 s). Jobs finished before v3 (no `export` field) are exported only on request (`worker.py export <job_id> [--again]`).
+- `entrada.py` is the only code that writes into the vault. Create-only (`O_EXCL`, no overwrite, no delete except our own `.watch-tmp/<job_id>`), realpath confinement, hostile-title sanitizing (separators, `..`, Windows reserved names, Cc/Cf/Cs/Co/Cn incl. bidi, trailing dots/spaces, 80 chars), frontmatter values as JSON strings (no YAML injection), structural Markdown escaping (every `\`, `[`, `]` escaped, `<` as entity, no code fences anywhere): no link, image, reference, footnote, wikilink, embed or HTML can come from a transcript or the model.
+- Note format copied from the Holocron (Manual §8/§9.9, `Kreile.Cloud Incidentes.index.md`, the Workshop reference note): `title`, `tipo: entrada`, `subtipo: video`, `status: rascunho`, `origem`, `job_id`, `data_processamento`, `data_criacao`, `duracao`, `autor`, `modelo_transcricao`, `idioma`, `resumo: ok|pendente|desligado`, `metodo_ingestao: transcricao`, tags. Links inside the folder are relative Markdown links (`[Transcrição](Transcrição.md)`, `![HH:MM:SS](frames/…)`): wikilinks would be ambiguous across many `Transcrição.md`.
+- Key frames: 10–20 from the v2 index, one per equal time window, scene cuts preferred; named `frame-HH-MM-SS.jpg`.
+- `resumo.py`: REST `generateContent`, key in `x-goog-api-key` (never in the URL), `thinkingLevel: low`, no `tools`; transcript and title inside nonce markers, declared as data. Key read and validated before every HTTP call; total deadline (daemon thread) including the body; errors are fixed Portuguese phrases, redacted. Block mode above 600,000 chars (partials + consolidation). `claude` provider implemented (Messages API) but untested live (no key); `none` disables.
+- Late summary: "available" (`summary.json` + `resumo: ok`) and "delivered" (`resumo_entregue`) are separate; delivery is idempotent (a `Resumo*.md` with this `job_id` is recognized). Pending summaries: 5 min doubling to 6 h; a non-transient error 3 times → `resumo: erro`, the note says how to retry (`export --again`).
+- `telegram_bot.py` (`watch-telegram`, jobs volume only): long polling, allow-list `1779779810` in a private chat, silent for anyone else (nothing logged), URLs from text/caption/entities (UTF-16 offsets), same `mcp_server.enqueue_analysis` as `analyze_video` (origin `telegram`, inbox names refused, `language="auto"`), offset + pending persisted in `/jobs/.telegram/state.json` after each update, backoff 1→60 s, 409 → 30 s.
+- Archived jobs never expire and do not count against `WATCH_JOBS_MAX_BYTES` (they keep transcript, index, frames, metadata; no video). Cleanup and the exporter share one exclusive per-job lock (`.export.lock`); a `done` job waiting for its note is not evicted.
+- One worker at a time: v3 services are in compose profile `v3`; a v3 worker takes `flock(/jobs/.worker.lock)` and also waits while another heartbeat (e.g. v2's) is fresh.
+
+### Decisions and why
+
+| Decision | Why |
+|---|---|
+| Archived = `state: "archived"` (not a flag on `done`) | The v2 cleanup already skips any state other than done/failed: protection also holds on rollback. |
+| Summary before publish; late summary as `Resumo.md` (or a new folder if the user moved the original) | The simplest form of "create-only". |
+| Gemini `gemini-3.8-flash` | Stable, newest Flash, 1,048,576-token input, image input (ai.google.dev, 2026-10-18). A 2:36 film transcript fits one call. |
+| Worker keeps v2's `/secrets` bind for cookies; Gemini key as a Docker secret; bot gets only the token | "No wider cookie access than v2". Side effect: the worker's `/secrets` bind also shows the other files of that folder (the worker never reads them). |
+| Telegram links with `language="auto"` | An English reel forced to `pt` came out as a bad translation in acceptance test 2. MCP keeps `pt` (v2 decision). |
+| `watch-worker` (v2) lost `build: .` | This branch's Dockerfile builds v3; `up --build` must not retag it as v2. Config hash unchanged (025d2091…), so no recreation. |
+
+### Environment findings
+
+- **Docker Desktop's Windows bind mounts answer `EINVAL` to `renameat2(RENAME_NOREPLACE)`, and a plain `rename` there replaces an empty directory** (probed in a scratch folder). The publish fallback reserves the final name with an exclusive `mkdir` and renames over its own reservation; verified on the same kind of mount.
+- **Gemini free tier:** Google states free-tier content is used to improve its products. `WATCH_RESUMO_CAIXA_ENTRADA=0` keeps local files out; `WATCH_RESUMO_PROVIDER=none` turns summaries off.
+- Permission classifier: refused a Docker probe of secret-file update visibility (so cookies stay exactly as in v2), the first start of the Telegram test bot (started after the user approved), and `docker rm` of a stopped test container (left stopped: `watch-mcp-v3test-telegram`).
+- `getUpdates` saw one transient network error (Kaspersky interception, see v2 findings); the backoff handled it.
+
+### Incident during acceptance (my bug, fixed)
+
+After the pass-1 fixes added `resumo_entregue`, I restarted the test worker (throwaway volume) with the real `00 - Entrada` mounted. Jobs exported earlier by the previous build had `resumo: ok` and no `resumo_entregue`, so the new code treated them as owing a summary: it re-created three test folders that had originally gone to scratch folders (32638b, c1a774, 42522e) and added a redundant `Resumo.md` to two real ones (88d76a, 30a0a4). Nothing was overwritten or deleted; the film (real volume) was not touched. I stopped the worker as soon as the log showed it. Fix (95f4921): only an explicit `resumo_entregue: false` (written by an export without summary) means a summary is owed; a missing field is treated as delivered. Without the fix the film's folder would have received a redundant `Resumo.md` once v3 ran on the real volume. Regression tests: `test_jobs_exported_before_resumo_entregue_existed_get_nothing_new`, `test_export_without_summary_records_an_explicit_debt`. The extra files were left in place for the user to decide (the worker never deletes in `00 - Entrada`).
+
+### Codex counter-review (v3): five passes, the brief's model and settings
+
+| Pass | Blocking | Main findings → fixes |
+|---|---|---|
+| 1 | 6 | Nested-label/blockquote links survived the sanitizer → structural escaping; a key with a newline leaked in a traceback → key validated, fixed messages, CLI never prints exceptions; cleanup could delete a job during export, export/finish races → shared per-job lock, read under the lock, idempotent `finish`; late summary lost or duplicated → available vs delivered; socket timeout ≠ total deadline → bounded call; `transcrição` vs `Transcrição.md` on Windows → casefold. Non-blocking: 401 recoverable, key re-read per call, bot reply failure, worker exclusivity (flock), key echo redacted, v2 `build:` removed. |
+| 2 | 4 | Error body read outside the deadline; `finish` on `Busy` reverted a finished export; a non-UTF-8 `Resumo*.md` blocked delivery; a publish before the state update was duplicated on recovery → `export_id` intent + adoption. Non-blocking: long titles hid markers, abandoned calls capped, stale cleanup claim, ready-job notification, bad status line, byte budget for names, honest pending callout. |
+| 3 | 1 | Age-based stale-lock reaping raced (`lstat → unlink`) → OS lock (`flock`), file never deleted to take ownership. Non-blocking: identifiers before variable fields, bot total deadline, call count, `--again` semantics documented and tested. |
+| 4 | 1 | `rmtree` could unlink `.export.lock` before the data → cleanup renames the job into `/jobs/.trash` under the lock first; exporter checks it still holds the job's own lock file (`samestat`). Non-blocking: bot abandoned calls capped. |
+| 5 | **0** | "No blocking issue left for production in this use." Non-blocking fixed: `.trash` leftovers count against the cap. Left as improvements: timed-out HTTP calls are capped but not cancelled; on rollback the v2 cleanup does not know `export: pendente` (stop v3 first, as documented). |
+
+Reports: `.codex/review-mcp-v3-pass{1..5}.md` (not versioned). Every fix has a regression test (`test_p1_*` … `test_p5_*`).
+
+### End-to-end acceptance
+
+| # | Test | Result |
+|---|---|---|
+| 1 | Export the film `0ed8ff98…` without reprocessing | `worker.py export` in a one-off v3 container on the real volume: folder `2026-10-18 - Devoradores de Estrelas (0ed8ff)` with summary (1 Gemini call), 860-line transcript, 20 key frames over 2:36. `transcript.json`/`index.json` hashes unchanged, 2734 frames kept. |
+| 2 | Instagram reel via Telegram to the note | User sent a reel to @InstWhisperBot (test stack: throwaway volume, real `00 - Entrada`): job `origin: telegram`, note with summary and 10 frames, bot tracking cleared (the "Pronto" message was sent without error). One transient `getUpdates` network error, absorbed by the backoff. Found: the reel was in English and `pt` was forced → `language="auto"` for Telegram links. |
+| 3 | Short YouTube via `analyze_video` (MCP, v3 entry args) | Note with summary and 10 frames in the real `00 - Entrada`; `job_status`/`list_jobs` show the folder and "arquivado". |
+| 4 | Gemini key removed, then back | Empty key file mounted in its place (the real file untouched): note with `resumo: pendente`, 0 HTTP calls; with the key back, `Resumo.md` created in the same folder, index note byte-identical. |
+| — | Vault mount missing, then back | Job `done`, `export: pendente`; with the mount back the note was created without a new Gemini call. |
+| 5 | Notes created with Obsidian closed | Not run: Obsidian was open during the session and I did not close it. Files are plain filesystem writes. |
+| 6 | Suites | Windows 598 passed, 15 skipped (POSIX-only); Linux inside `watch-mcp:v3` **613 passed, 0 skipped**. |
+| 7 | Codex last pass without blocking | Pass 5: none. |
+| — | Final run with the final image | Scratch folder: server 0.4.0, archived, summary ok, 10 frames, `export_id` at the top of the frontmatter. |
+
+### State at the end of the sprint (not promoted, on the user's decision)
+
+- Production unchanged: Desktop `watch` → `watch-mcp:v2`; `watch-mcp-worker` (v2) running; v2 compose hashes unchanged.
+- Images: `watch-mcp:v3` built; `v2`, `latest`, `v1` untouched.
+- Test stack still running (no restart policy): `watch-mcp-v3test-worker` (volume `watch-mcp-v3test-jobs`, real `00 - Entrada`) and `watch-mcp-v3test-telegram2` (the bot). `watch-mcp-v3test-telegram` is stopped (removal refused by the permission classifier).
+- In the vault, besides the film note: the notes of acceptance 2 and 3, plus the incident's three re-created test folders and two redundant `Resumo.md` (left for the user).
+- Promotion steps when decided: README "MCP local v3" → "Subir"; Desktop entry from `entry_v3()`; then merge `mcp-v3` → `mcp-local` (ff-only), tag `v3-mcp`, release text in `RELEASE-v3.md`.
