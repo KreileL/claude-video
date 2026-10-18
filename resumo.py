@@ -172,16 +172,12 @@ def _timeout(deadline: float | None, key: str) -> float:
     return left
 
 
-def _http_error(exc: urllib.error.HTTPError, name: str, key: str) -> ResumoError:
-    code = exc.code
+def _http_error(code: int, raw: bytes, name: str, key: str) -> ResumoError:
     if code == 429:
         return _fail("limite de uso atingido (HTTP 429)", key, transient=True)
     if code in (500, 502, 503, 504):
         return _fail(f"serviço indisponível (HTTP {code})", key, transient=True)
-    try:
-        body = exc.read(4096).decode("utf-8", errors="replace")
-    except Exception:
-        body = ""
+    body = raw.decode("utf-8", errors="replace")
     if code == 401 or (code in (400, 403) and any(m.lower() in body.lower() for m in _KEY_PROBLEM)):
         return _fail(f"chave do {name} recusada (HTTP {code})", key, transient=True)
     return _fail(f"requisição recusada (HTTP {code})", key, transient=False)
@@ -194,35 +190,57 @@ def _post(url: str, headers: dict, body: dict, name: str, key: str,
     request = Request(url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
     CALLS[name] += 1
     try:
-        raw = _bounded(lambda: _fetch(request, timeout), timeout)
-        return json.loads(raw.decode("utf-8", errors="replace"))
+        status, raw = _bounded(lambda: _fetch(request, timeout), timeout)
     except _Late:
         raise _fail("tempo esgotado", key, transient=True) from None
-    except urllib.error.HTTPError as exc:
-        raise _http_error(exc, name, key) from None
-    except json.JSONDecodeError:
-        raise _fail("resposta inválida do serviço", key, transient=False) from None
+    except _Crowded:
+        raise _fail("chamadas anteriores ao provedor ainda em andamento", key, transient=True) from None
     except (urllib.error.URLError, OSError, HTTPException) as exc:
         reason = getattr(exc, "reason", exc)
         msg = "tempo esgotado" if isinstance(reason, TimeoutError) else "erro de rede"
         raise _fail(msg, key, transient=True) from None
     except Exception:  # noqa: BLE001 - e.g. ValueError from a header: its text may hold the key
         raise _fail("requisição inválida", key, transient=False) from None
+    if status != 200:
+        raise _http_error(status, raw, name, key)
+    try:
+        return json.loads(raw.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        raise _fail("resposta inválida do serviço", key, transient=False) from None
 
 
 class _Late(Exception):
     """The request did not finish inside the total deadline."""
 
 
-def _fetch(request: Request, timeout: float) -> bytes:
-    with urlopen(request, timeout=timeout) as response:
-        return response.read(MAX_RESPONSE_BYTES)
+class _Crowded(Exception):
+    """Too many earlier calls are still running after their deadline."""
+
+
+MAX_ABANDONED = 3
+_ABANDONED: list[threading.Thread] = []
+
+
+def _fetch(request: Request, timeout: float) -> tuple[int, bytes]:
+    """(status, body); an HTTP error body is read here too, inside the total
+    deadline, and only when the status alone does not classify it."""
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return 200, response.read(MAX_RESPONSE_BYTES)
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, (exc.read(4096) if exc.code in (400, 403) else b"")
+        finally:
+            exc.close()
 
 
 def _bounded(call, seconds: float):
     """Run call() with a TOTAL time limit (a socket timeout is per operation, so a
     slowly trickling body could otherwise last far longer). An abandoned call
     keeps its daemon thread until the socket timeout ends it."""
+    _ABANDONED[:] = [t for t in _ABANDONED if t.is_alive()]
+    if len(_ABANDONED) >= MAX_ABANDONED:
+        raise _Crowded()
     box: dict = {}
 
     def target():
@@ -235,6 +253,7 @@ def _bounded(call, seconds: float):
     thread.start()
     thread.join(max(0.0, seconds))
     if thread.is_alive():
+        _ABANDONED.append(thread)
         raise _Late()
     if "error" in box:
         raise box["error"]

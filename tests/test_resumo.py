@@ -302,3 +302,59 @@ def test_p1_key_echoed_in_a_successful_answer_is_redacted(keys):
     with stub(lambda n, p, b: (200, echo, 0)) as (url, _):
         out = run(url)
     assert KEY not in out.text and "***" in out.text
+
+
+# ── Codex v3 pass 2 ─────────────────────────────────────────────────────────
+
+
+def test_p2_a_slow_error_body_respects_the_total_deadline(keys):
+    class SlowError(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            body = b'{"error": "API key not valid ' + b"x" * 40 + b'"}'
+            self.send_response(400)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            for byte in body:
+                try:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(0.02)
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SlowError)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        start = time.monotonic()
+        with pytest.raises(resumo.ResumoError) as err:
+            run(f"http://127.0.0.1:{server.server_port}", deadline=time.monotonic() + 0.08)
+        assert err.value.transient and time.monotonic() - start < 0.5
+    finally:
+        server.shutdown()
+
+
+def test_p2_abandoned_calls_are_capped(keys, monkeypatch):
+    release = threading.Event()
+    calls = []
+
+    def blocked(request, timeout):
+        calls.append(1)
+        release.wait(5)
+        return 200, json.dumps(GOOD).encode()
+
+    monkeypatch.setattr(resumo, "_fetch", blocked)
+    monkeypatch.setattr(resumo, "_ABANDONED", [])
+    try:
+        for _ in range(resumo.MAX_ABANDONED):
+            with pytest.raises(resumo.ResumoError, match="tempo esgotado"):
+                run("http://127.0.0.1:9", deadline=time.monotonic() + 0.05)
+        with pytest.raises(resumo.ResumoError) as err:
+            run("http://127.0.0.1:9", deadline=time.monotonic() + 0.05)
+        assert err.value.transient and "ainda em andamento" in str(err.value)
+        assert len(calls) == resumo.MAX_ABANDONED
+    finally:
+        release.set()
