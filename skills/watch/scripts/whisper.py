@@ -473,6 +473,14 @@ def shift_segments(segments: list[dict], offset_seconds: float) -> list[dict]:
     ]
 
 
+def require_transcription(data) -> dict:
+    """A body that is really a transcription: an error object (even with HTTP 200)
+    must not read as "no speech" (MCP v3: silence is reported, errors fail)."""
+    if not isinstance(data, dict) or "error" in data or not ("segments" in data or "text" in data):
+        raise SystemExit("Whisper returned an invalid response (no transcription in it)")
+    return data
+
+
 def _segments_from_response(data: dict) -> list[dict]:
     """Convert Whisper verbose_json into our {start, end, text} segment format."""
     out: list[dict] = []
@@ -523,6 +531,8 @@ def transcribe_chunks(
 
     if failures == len(chunks):
         raise SystemExit("Whisper failed on every audio chunk")
+    if failures and not segments:  # an error must not pass for silence
+        raise SystemExit(f"Whisper failed on {failures} of {len(chunks)} audio chunks; the others had no speech")
     return segments
 
 
@@ -543,7 +553,7 @@ def _transcribe_file(backend: str, api_key: str, audio_path: Path) -> list[dict]
         response = _post_whisper(OPENAI_ENDPOINT, api_key, OPENAI_MODEL, audio_path)
     else:
         raise SystemExit(f"Unknown whisper backend: {backend}")
-    return _segments_from_response(response)
+    return _segments_from_response(require_transcription(response))
 
 
 def transcribe_local(
@@ -566,19 +576,24 @@ def transcribe_local(
         {"language": language, "prompt": prompt},
         deadline=deadline,
     )
-    return _segments_from_response(response)
+    return _segments_from_response(require_transcription(response))
 
 
 LANGUAGE_NAMES = {  # OpenAI-style servers answer full names, faster-whisper ones codes
     "portuguese": "pt", "english": "en", "spanish": "es", "french": "fr", "german": "de",
     "italian": "it", "japanese": "ja", "chinese": "zh", "korean": "ko", "russian": "ru",
+    "dutch": "nl", "polish": "pl", "turkish": "tr", "arabic": "ar", "hindi": "hi",
+    "swedish": "sv", "ukrainian": "uk", "greek": "el", "hebrew": "he", "catalan": "ca",
+    "czech": "cs", "danish": "da", "finnish": "fi", "norwegian": "no", "romanian": "ro",
+    "hungarian": "hu", "indonesian": "id", "vietnamese": "vi", "thai": "th", "galician": "gl",
 }
 
 
 def detect_language_local(audio_path: Path, *, model: str, deadline: float | None = None) -> tuple[str | None, bool]:
     """(language code, has_speech) for one sample, with no language forced: the
     server detects it. For the MCP worker's majority vote over several samples."""
-    response = _post_whisper(local_endpoint(), setting(API_KEY_KEY), model, audio_path, deadline=deadline)
+    response = require_transcription(
+        _post_whisper(local_endpoint(), setting(API_KEY_KEY), model, audio_path, deadline=deadline))
     raw = str(response.get("language") or "").strip().lower()
     code = LANGUAGE_NAMES.get(raw, raw)
     has_speech = bool(_segments_from_response(response))

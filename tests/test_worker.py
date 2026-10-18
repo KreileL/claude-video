@@ -424,3 +424,15 @@ def test_silent_media_is_no_speech_not_a_failure(dirs, fake_whisper, monkeypatch
     assert "sem fala no áudio" in status and "falhou" not in status
     text = asyncio.run(mcp_server.watch_video(job_id=job["id"], detail="transcript"))[0].text
     assert "Sem fala no áudio" in text
+
+
+def test_p6_an_error_body_with_http_200_fails_the_job_not_no_speech(dirs, monkeypatch):
+    """Codex v3 pass 6: {"error": ...} with 200 used to read as an empty transcript,
+    and the job ended as "sem fala" with a note."""
+    jobs, box = dirs
+    make_clip(box / "clip.mp4", seconds=25)
+    monkeypatch.setattr(whisper, "_post_whisper", lambda *a, **k: {"error": "model unavailable"})
+    job = new_job(jobs, language=None)
+    worker.process(job, root=jobs, inbox_root=box)
+    data = jobstore.load_job(job["id"], jobs)
+    assert data["state"] == "failed" and data.get("speech") is not False

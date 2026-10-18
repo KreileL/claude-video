@@ -590,3 +590,22 @@ def test_tracking_parameters_never_reach_the_job(tmp_path, monkeypatch):
     assert job["source"]["value"] == "https://www.instagram.com/reel/DeX7nFXC_Hm/"
     again, reused = mcp_server.enqueue_analysis("https://www.instagram.com/reel/DeX7nFXC_Hm/?igsh=abc")
     assert reused and again["id"] == job["id"]  # other share link, same video
+
+
+# ── Codex v3 pass 6 ─────────────────────────────────────────────────────────
+
+
+def test_p6_an_error_quoting_the_no_speech_phrase_is_still_an_error(fake_pipeline, monkeypatch):
+    monkeypatch.setattr(mcp_server, "run_process", _proc_with_stderr(
+        "[watch] whisper fallback failed: Whisper request failed: HTTP Error 400: Bad Request"
+        " — {\"detail\": \"Whisper returned no transcript segments\"}\n"))
+    with pytest.raises(ToolError, match="Nenhuma transcrição"):
+        run(mcp_server.transcribe_video("http://public.test/x"))
+
+
+def test_p6_auto_never_inherits_a_forced_language_from_the_environment(fake_pipeline, monkeypatch):
+    monkeypatch.setenv("WATCH_WHISPER_LANGUAGE", "pt")
+    seen = []
+    monkeypatch.setattr(mcp_server, "run_process", _proc_with_stderr("", seen))
+    run(mcp_server.watch_video("http://public.test/x", detail="transcript"))
+    assert "WATCH_WHISPER_LANGUAGE" not in seen[-1]["env"]

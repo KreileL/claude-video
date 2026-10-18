@@ -219,3 +219,29 @@ def test_transcribe_local_respects_a_deadline(server, audio, monkeypatch):
     assert time.monotonic() - started < 3.0  # no 5 s backoff past the deadline
     with pytest.raises(SystemExit, match="deadline"):
         whisper.transcribe_local(audio, model="m", deadline=time.monotonic() - 1.0)
+
+
+# ── Codex v3 pass 6: an error must not read as "no speech" ─────────────────
+
+
+def test_p6_error_bodies_are_not_transcriptions():
+    import pytest as _pytest
+    for bad in ({"error": "model unavailable"}, {"detail": "x"}, [], "texto"):
+        with _pytest.raises(SystemExit, match="invalid response"):
+            whisper.require_transcription(bad)
+    assert whisper.require_transcription({"text": "", "segments": []}) == {"text": "", "segments": []}
+
+
+def test_p6_a_partial_failure_with_silent_rest_is_an_error(tmp_path):
+    import pytest as _pytest
+    calls = iter([SystemExit("HTTP Error 503"), []])
+
+    def one(path):
+        result = next(calls)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    with _pytest.raises(SystemExit) as err:
+        whisper.transcribe_chunks([(tmp_path / "a", 0.0), (tmp_path / "b", 600.0)], one)
+    assert "no transcript segments" not in str(err.value) and "1 of 2" in str(err.value)

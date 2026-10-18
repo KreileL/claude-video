@@ -505,6 +505,8 @@ async def run_watch(
                 "WATCH_YTDLP_TIMEOUT": str(YTDLP_TIMEOUT),
                 **({"WATCH_WHISPER_LANGUAGE": language} if language != "auto" else {}),
             })
+            if language == "auto":
+                env.pop("WATCH_WHISPER_LANGUAGE", None)  # never inherited from the server's environment
             try:
                 code, stdout, stderr = await run_process(
                     argv, env=env, cwd=work, timeout=remaining(), ctx=ctx, label="baixando e analisando",
@@ -525,7 +527,7 @@ async def run_watch(
         result = RunResult(info=info, frames=parse_frames(stdout, run_dir / "frames"), secrets=secrets)
         result.segments, result.transcript_source = read_transcript(run_dir)
         for line in stderr.splitlines():
-            if "whisper fallback failed" in line and NO_SPEECH_MARK in line:
+            if line.strip() == NO_SPEECH_LINE:
                 result.no_speech = True  # silence or music: not an error
             elif "whisper fallback failed" in line:
                 result.warnings.append(f"Transcrição Whisper falhou: {scrub(line.split('failed:', 1)[-1].strip(), secrets)}")
@@ -591,7 +593,9 @@ def encode_frames(frames: list[Frame], budget: int) -> tuple[list[Frame], list[s
     return [frames[i] for i in picks], [encoded[i] for i in picks], note
 
 
-NO_SPEECH_MARK = "returned no transcript segments"  # whisper.py, when it heard nothing
+# The exact line watch.py prints when Whisper answered validly with no speech (a
+# substring would also match an error body quoting it: Codex v3 pass 6).
+NO_SPEECH_LINE = "[watch] whisper fallback failed: Whisper returned no transcript segments"
 NO_SPEECH_TEXT = "Sem fala no áudio."
 
 
