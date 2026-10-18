@@ -116,18 +116,22 @@ def prompts(clip: dict) -> dict[str, str | None]:
     return modes
 
 
-def unload_all() -> None:
-    try:
-        with urllib.request.urlopen(f"{BASE}/api/ps", timeout=30) as response:
-            loaded = json.load(response).get("models", [])
-    except Exception:
-        return
-    for name in loaded:  # model ids (STT only in speaches 0.8)
-        req = urllib.request.Request(f"{BASE}/api/ps/{name}", method="DELETE")
+def unload_all(limit: float = 300.0) -> None:
+    """Wait until speaches' idle TTL (120 s) has unloaded every model.
+
+    Never DELETE /api/ps/{model}: in speaches 0.8.3 an explicit unload while
+    the TTL offload is scheduled deadlocked the model manager (every later
+    transcription hung until the container was restarted; NOTES-mcp.md).
+    """
+    end = time.monotonic() + limit
+    while time.monotonic() < end:
         try:
-            urllib.request.urlopen(req, timeout=60).close()
+            with urllib.request.urlopen(f"{BASE}/api/ps", timeout=30) as response:
+                if not json.load(response).get("models"):
+                    return
         except Exception:
             pass
+        time.sleep(10)
 
 
 def transcribe(audio: Path, model: str, prompt: str | None) -> tuple[str, float]:
@@ -188,8 +192,15 @@ def drafts() -> None:
     for clip in clips():
         if clip["kind"] != "real-approx":
             continue
-        hyp, _ = transcribe(clip["audio"], "Systran/faster-whisper-large-v3", None)
-        (out_dir / f"{clip['id']}.txt").write_text(hyp + "\n", encoding="utf-8")
+        # 30 s pieces, each a fresh request: a repetition loop (large-v3 looped
+        # on the podcast's laughter) cannot run past its own piece.
+        pieces = Path("/tmp") / clip["id"]
+        pieces.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(clip["audio"]),
+                        "-f", "segment", "-segment_time", "30", "-c", "copy", str(pieces / "p%03d.mp3")],
+                       check=True)
+        texts = [transcribe(p, "Systran/faster-whisper-large-v3", None)[0] for p in sorted(pieces.glob("p*.mp3"))]
+        (out_dir / f"{clip['id']}.txt").write_text(" ".join(texts) + "\n", encoding="utf-8")
         print(f"draft {clip['id']}", flush=True)
     unload_all()
 
