@@ -477,3 +477,31 @@ def test_p1_only_one_v3_worker_owns_the_queue(env):
     second = worker.lock_worker(jobs, sleep=release)
     assert sleeps == [5] and second is not None
     os.close(second)
+
+
+def test_jobs_exported_before_resumo_entregue_existed_get_nothing_new(env):
+    """Regression (acceptance run): jobs exported by an earlier build had resumo ok and no
+    resumo_entregue; a later worker re-delivered Resumo.md and re-created folders."""
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    postproc.finish(jid)
+    job = jobstore.load_job(jid, jobs)
+    del job["resumo_entregue"]
+    jobstore.write_json_atomic(jobs / jid / "job.json", job)
+    before = sorted(p.name for p in vault.rglob("*"))
+    assert postproc.retry_due(now=time.time() + 10**7) == 0
+    postproc.add_late_summary(jid)
+    assert sorted(p.name for p in vault.rglob("*")) == before
+
+
+def test_export_without_summary_records_an_explicit_debt(env, monkeypatch):
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    monkeypatch.setattr(resumo, "summarize",
+                        lambda s, **kw: (_ for _ in ()).throw(resumo.ResumoError("erro de rede", transient=True)))
+    postproc.finish(jid)
+    assert jobstore.load_job(jid, jobs)["resumo_entregue"] is False
+    jid2 = done_job(jobs)
+    monkeypatch.setattr(resumo, "summarize", lambda s, **kw: resumo.Summary(SUMMARY, "gemini", "m", 1))
+    postproc.finish(jid2)
+    assert jobstore.load_job(jid2, jobs)["resumo_entregue"] is True

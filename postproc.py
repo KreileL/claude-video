@@ -329,8 +329,8 @@ def add_late_summary(job_id: str, root: Path | None = None, entrada_root: Path |
     lock = _lock(job_dir)
     try:
         job = jobstore.load_job(job_id, root)
-        if job.get("export") != "ok" or job.get("resumo_entregue"):
-            return
+        if job.get("export") != "ok" or job.get("resumo_entregue") is not False:
+            return  # absent = exported before this field existed: treat as delivered
         mat = _material(job, root)
         summary = stored_summary(job_dir)
         if summary is None:
@@ -381,6 +381,14 @@ def finish(job_id: str, root: Path | None = None, entrada_root: Path | None = No
             pass
 
 
+def awaiting_summary(job: dict) -> bool:
+    """Only an explicit False (written by an export without summary) means a summary
+    is owed to the note. A missing field is a job exported before the field existed,
+    whose note already has its summary: treating it as owed re-delivered summaries
+    (and re-created folders that had gone to another vault) in the acceptance run."""
+    return job.get("resumo_entregue") is False
+
+
 def late_summary_due(job: dict, root: Path | None, now: float) -> bool:
     state = job.get("resumo")
     if state == "ok":  # available, not delivered yet
@@ -406,7 +414,7 @@ def retry_due(root: Path | None = None, entrada_root: Path | None = None, now: f
             if job.get("export") == "pendente" and jobstore.as_number(job.get("export_next")) <= now:
                 ran += 1
                 run_export(job["id"], root, entrada_root)
-            elif job.get("export") == "ok" and not job.get("resumo_entregue") and late_summary_due(job, root, now):
+            elif job.get("export") == "ok" and awaiting_summary(job) and late_summary_due(job, root, now):
                 ran += 1
                 add_late_summary(job["id"], root, entrada_root)
         except Busy:
