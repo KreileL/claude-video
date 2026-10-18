@@ -108,13 +108,21 @@ class _Late(Exception):
     pass
 
 
+MAX_ABANDONED = 3
+_ABANDONED: list[threading.Thread] = []
+
+
 def _read(req: urllib.request.Request, timeout: float) -> bytes:
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read(MAX_RESPONSE_BYTES)
 
 
 def _bounded(call, seconds: float):
-    """call() with a TOTAL time limit (a socket timeout is per operation)."""
+    """call() with a TOTAL time limit (a socket timeout is per operation). At most
+    MAX_ABANDONED timed-out calls may still be running; then calls are refused."""
+    _ABANDONED[:] = [t for t in _ABANDONED if t.is_alive()]
+    if len(_ABANDONED) >= MAX_ABANDONED:
+        raise _Late()
     box: dict = {}
 
     def target():
@@ -127,6 +135,7 @@ def _bounded(call, seconds: float):
     thread.start()
     thread.join(max(0.0, seconds))
     if thread.is_alive():
+        _ABANDONED.append(thread)
         raise _Late()
     if "error" in box:
         raise box["error"]

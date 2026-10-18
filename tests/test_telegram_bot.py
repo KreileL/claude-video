@@ -418,3 +418,17 @@ def test_p3_a_trickling_answer_respects_a_total_deadline():
         assert time.monotonic() - start < 4.0  # total = 0.5 * 1.2 + 2 s
     finally:
         server.shutdown()
+
+
+def test_p4_timed_out_calls_are_capped(monkeypatch):
+    release = threading.Event()
+    monkeypatch.setattr(tb, "_ABANDONED", [])
+    monkeypatch.setattr(tb, "_read", lambda req, timeout: release.wait(5) or b'{"ok": true, "result": []}')
+    api = tb.Api(TOKEN, base="http://127.0.0.1:9")
+    try:
+        for _ in range(tb.MAX_ABANDONED + 2):
+            with pytest.raises(tb.TelegramError, match="tempo esgotado"):
+                api.call("getUpdates", {}, 0.01)
+        assert len(tb._ABANDONED) == tb.MAX_ABANDONED  # refused calls start no new thread
+    finally:
+        release.set()
