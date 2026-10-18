@@ -229,3 +229,76 @@ def test_split_blocks_respects_limit():
 
 def test_redact():
     assert resumo.redact("a KEY-12345678 b short", ["KEY-12345678", "short"]) == "a *** b short"
+
+
+# ── Codex v3 pass 1 ─────────────────────────────────────────────────────────
+
+
+def test_p1_malformed_key_is_refused_without_leaking_or_calling(keys):
+    g, _ = keys
+    g.write_text("FIRST-FAKE-KEY-aaaaaaaa\nSECOND-FAKE-KEY-bbbbbbbb\n")
+    with stub(lambda n, p, b: (200, GOOD, 0)) as (url, seen):
+        with pytest.raises(resumo.ResumoError) as err:
+            run(url)
+    assert err.value.transient and "formato inválido" in str(err.value)
+    assert "FIRST-FAKE" not in str(err.value) and "SECOND-FAKE" not in str(err.value) and seen == []
+
+
+def test_p1_trickling_body_respects_the_total_deadline(keys):
+    class Trickle(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            body = json.dumps(GOOD).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            for byte in body:
+                try:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(0.025)
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        start = time.monotonic()
+        with pytest.raises(resumo.ResumoError) as err:
+            run(f"http://127.0.0.1:{server.server_port}", deadline=time.monotonic() + 0.15)
+        assert err.value.transient and "tempo esgotado" in str(err.value)
+        assert time.monotonic() - start < 0.6
+    finally:
+        server.shutdown()
+
+
+def test_p1_plain_401_is_recoverable(keys):
+    with stub(lambda n, p, b: (401, {"error": "Unauthorized"}, 0)) as (url, _):
+        with pytest.raises(resumo.ResumoError) as err:
+            run(url)
+    assert err.value.transient and "recusada" in str(err.value)
+
+
+def test_p1_key_is_reread_before_every_http_call(keys, monkeypatch):
+    g, _ = keys
+    monkeypatch.setattr(resumo, "BLOCK_CHARS", 20)
+
+    def responder(n, path, body):
+        if n == 1:
+            g.write_text("ROTATED-FAKE-KEY-0123456789")
+        return 200, GOOD, 0
+
+    with stub(responder) as (url, seen):
+        run(url)
+    assert seen[0]["headers"]["x-goog-api-key"] == KEY
+    assert all(r["headers"]["x-goog-api-key"] == "ROTATED-FAKE-KEY-0123456789" for r in seen[1:]) and len(seen) > 2
+
+
+def test_p1_key_echoed_in_a_successful_answer_is_redacted(keys):
+    echo = {"candidates": [{"content": {"parts": [{"text": f"## Síntese\na chave é {KEY}"}]}}]}
+    with stub(lambda n, p, b: (200, echo, 0)) as (url, _):
+        out = run(url)
+    assert KEY not in out.text and "***" in out.text

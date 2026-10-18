@@ -11,8 +11,10 @@ import dataclasses
 import json
 import math
 import os
+import re
 import secrets
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -38,6 +40,9 @@ MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 CALLS = {"gemini": 0, "claude": 0}
 
 _KEY_PROBLEM = ("API_KEY_INVALID", "API key", "authentication")
+# A key is one printable token: a newline or control char would end up in an HTTP
+# header, and http.client puts the bad header value in its exception message.
+KEY_RE = re.compile(r"^[\x21-\x7e]{8,512}$")
 
 
 class ResumoError(Exception):
@@ -153,6 +158,8 @@ def _read_key(path: Path, name: str) -> str:
         key = ""
     if not key:
         raise ResumoError(f"chave do {name} ausente", transient=True)
+    if not KEY_RE.fullmatch(key):
+        raise ResumoError(f"chave do {name} em formato inválido (confira o arquivo do secret)", transient=True)
     return key
 
 
@@ -175,7 +182,7 @@ def _http_error(exc: urllib.error.HTTPError, name: str, key: str) -> ResumoError
         body = exc.read(4096).decode("utf-8", errors="replace")
     except Exception:
         body = ""
-    if code in (400, 401, 403) and any(m.lower() in body.lower() for m in _KEY_PROBLEM):
+    if code == 401 or (code in (400, 403) and any(m.lower() in body.lower() for m in _KEY_PROBLEM)):
         return _fail(f"chave do {name} recusada (HTTP {code})", key, transient=True)
     return _fail(f"requisição recusada (HTTP {code})", key, transient=False)
 
@@ -187,9 +194,10 @@ def _post(url: str, headers: dict, body: dict, name: str, key: str,
     request = Request(url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
     CALLS[name] += 1
     try:
-        with urlopen(request, timeout=timeout) as response:
-            raw = response.read(MAX_RESPONSE_BYTES)
+        raw = _bounded(lambda: _fetch(request, timeout), timeout)
         return json.loads(raw.decode("utf-8", errors="replace"))
+    except _Late:
+        raise _fail("tempo esgotado", key, transient=True) from None
     except urllib.error.HTTPError as exc:
         raise _http_error(exc, name, key) from None
     except json.JSONDecodeError:
@@ -198,10 +206,44 @@ def _post(url: str, headers: dict, body: dict, name: str, key: str,
         reason = getattr(exc, "reason", exc)
         msg = "tempo esgotado" if isinstance(reason, TimeoutError) else "erro de rede"
         raise _fail(msg, key, transient=True) from None
+    except Exception:  # noqa: BLE001 - e.g. ValueError from a header: its text may hold the key
+        raise _fail("requisição inválida", key, transient=False) from None
 
 
-def _gemini_call(system: str, user: str, frames: list, model: str, key: str,
+class _Late(Exception):
+    """The request did not finish inside the total deadline."""
+
+
+def _fetch(request: Request, timeout: float) -> bytes:
+    with urlopen(request, timeout=timeout) as response:
+        return response.read(MAX_RESPONSE_BYTES)
+
+
+def _bounded(call, seconds: float):
+    """Run call() with a TOTAL time limit (a socket timeout is per operation, so a
+    slowly trickling body could otherwise last far longer). An abandoned call
+    keeps its daemon thread until the socket timeout ends it."""
+    box: dict = {}
+
+    def target():
+        try:
+            box["value"] = call()
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the caller
+            box["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(max(0.0, seconds))
+    if thread.is_alive():
+        raise _Late()
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+def _gemini_call(system: str, user: str, frames: list, model: str, load_key,
                  deadline: float | None) -> str:
+    key = load_key()
     parts: list[dict] = [{"text": user}]
     for at, data in frames:
         parts.append({"text": f"Frame em {_hms(at)}"})
@@ -228,11 +270,12 @@ def _gemini_call(system: str, user: str, frames: list, model: str, key: str,
     if block or not text:
         raise _fail(f"resposta vazia ou bloqueada ({block or finish or 'sem candidatos'})",
                     key, transient=False)
-    return text
+    return redact(text, [key])
 
 
-def _claude_call(system: str, user: str, frames: list, model: str, key: str,
+def _claude_call(system: str, user: str, frames: list, model: str, load_key,
                  deadline: float | None) -> str:
+    key = load_key()
     content: list[dict] = [{"type": "text", "text": user}]
     for at, data in frames:
         content.append({"type": "text", "text": f"Frame em {_hms(at)}"})
@@ -250,7 +293,7 @@ def _claude_call(system: str, user: str, frames: list, model: str, key: str,
     if not text:
         reason = data.get("stop_reason") if isinstance(data, dict) else None
         raise _fail(f"resposta vazia ou bloqueada ({reason or 'sem texto'})", key, transient=False)
-    return text
+    return redact(text, [key])
 
 
 def summarize(segments: list[dict], *, title: str, duration: float | None,
@@ -260,14 +303,15 @@ def summarize(segments: list[dict], *, title: str, duration: float | None,
     if provider == "none":
         raise ResumoDisabled("resumo desativado")
     if provider == "gemini":
-        key = _read_key(GEMINI_KEY_FILE, "gemini")
+        load = lambda: _read_key(GEMINI_KEY_FILE, "gemini")  # noqa: E731
         model, call = model or GEMINI_MODEL, _gemini_call
     elif provider == "claude":
-        key = _read_key(CLAUDE_KEY_FILE, "claude")
+        load = lambda: _read_key(CLAUDE_KEY_FILE, "claude")  # noqa: E731
         model, call = model or CLAUDE_MODEL, _claude_call
     else:
         raise ResumoError("provedor de resumo desconhecido", transient=False)
 
+    key = load()  # fail fast (no HTTP call) when the key is missing or malformed
     text = transcript_text(segments)
     if not text:
         raise ResumoError("transcrição vazia", transient=False)
@@ -275,7 +319,7 @@ def summarize(segments: list[dict], *, title: str, duration: float | None,
     calls = 0
     if len(text) <= BLOCK_CHARS:
         system, user = build_prompt(text, title=title, duration=duration)
-        out = call(system, user, frames, model, key, deadline)
+        out = call(system, user, frames, model, load, deadline)
         calls = 1
     else:
         blocks = split_blocks(text, BLOCK_CHARS)
@@ -283,11 +327,11 @@ def summarize(segments: list[dict], *, title: str, duration: float | None,
         for i, block in enumerate(blocks, 1):
             system, user = build_prompt(block, title=title, duration=duration,
                                         part=(i, len(blocks)))
-            partials.append(call(system, user, [], model, key, deadline))
+            partials.append(call(system, user, [], model, load, deadline))
             calls += 1
         joined = "\n\n".join(f"### Parte {i}\n{p}" for i, p in enumerate(partials, 1))
         system, user = build_prompt(joined, title=title, duration=duration, consolidate=True)
-        out = call(system, user, frames, model, key, deadline)
+        out = call(system, user, frames, model, load, deadline)
         calls += 1
     out = out.strip()
     if not out:
