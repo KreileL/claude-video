@@ -41,9 +41,11 @@ def docker_args(home: Path | None = None, extra_env: dict[str, str] | None = Non
 
 
 def entry(home: Path | None = None, environ: dict[str, str] | None = None) -> dict:
-    environ = dict(os.environ if environ is None else environ)
+    # Windows env names are case-insensitive and os.environ upper-cases them
+    # (SYSTEMROOT), so match without case and write the conventional spelling.
+    upper = {k.upper(): v for k, v in (os.environ if environ is None else environ).items()}
     return {
         "command": "docker",
         "args": docker_args(home),
-        "env": {k: environ[k] for k in ENV_KEYS if k in environ},
+        "env": {k: upper[k.upper()] for k in ENV_KEYS if k.upper() in upper},
     }
