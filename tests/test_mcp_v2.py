@@ -101,7 +101,7 @@ def test_analyze_url_creates_job_and_reuses_cache(v2):
     job_id = job_id_from(first)
     job = jobstore.load_job(job_id)
     assert job["state"] == "queued" and job["source"] == {"kind": "url", "value": "https://example.com/video"}
-    assert job["language"] == "pt" and job["terms"] == ["Embrapa"]
+    assert job["language"] is None and job["terms"] == ["Embrapa"]  # v3: "auto" by default
     again = run(mcp_server.analyze_video("https://example.com/video", terms=["Embrapa"]))
     assert "reaproveitando" in again and job_id in again
     assert len(jobstore.list_jobs()) == 1

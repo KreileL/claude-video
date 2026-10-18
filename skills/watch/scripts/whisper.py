@@ -536,6 +536,7 @@ def _transcribe_file(backend: str, api_key: str, audio_path: Path) -> list[dict]
             None if api_key == LOCAL_NO_KEY else api_key,
             local_model(),
             audio_path,
+            _forced_language(),
         )
     elif backend == "openai":
         # Always OpenAI itself: local overrides must never redirect the real key.
@@ -566,6 +567,27 @@ def transcribe_local(
         deadline=deadline,
     )
     return _segments_from_response(response)
+
+
+LANGUAGE_NAMES = {  # OpenAI-style servers answer full names, faster-whisper ones codes
+    "portuguese": "pt", "english": "en", "spanish": "es", "french": "fr", "german": "de",
+    "italian": "it", "japanese": "ja", "chinese": "zh", "korean": "ko", "russian": "ru",
+}
+
+
+def detect_language_local(audio_path: Path, *, model: str, deadline: float | None = None) -> tuple[str | None, bool]:
+    """(language code, has_speech) for one sample, with no language forced: the
+    server detects it. For the MCP worker's majority vote over several samples."""
+    response = _post_whisper(local_endpoint(), setting(API_KEY_KEY), model, audio_path, deadline=deadline)
+    raw = str(response.get("language") or "").strip().lower()
+    code = LANGUAGE_NAMES.get(raw, raw)
+    has_speech = bool(_segments_from_response(response))
+    return (code if len(code) == 2 and code.isalpha() else None), has_speech
+
+
+def _forced_language() -> dict[str, str | None]:
+    # MCP v3: watch_video/transcribe_video(language=...) overrides detection.
+    return {"language": os.environ.get("WATCH_WHISPER_LANGUAGE") or None}
 
 
 def transcribe_video(

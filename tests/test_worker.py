@@ -2,6 +2,7 @@
 Whisper server (no network; real ffmpeg, real yt-dlp for the URL path)."""
 from __future__ import annotations
 
+import asyncio
 import functools
 import http.server
 import json
@@ -39,7 +40,9 @@ def make_clip(path: Path, seconds: int = 65, video: bool = True) -> Path:
 
 @pytest.fixture
 def fake_whisper(monkeypatch):
-    state = {"requests": [], "status": 200}
+    # v3: a request without a language field is a language-detection sample
+    # (language="auto"); it answers state["language"] and does not count as a block.
+    state = {"requests": [], "detections": [], "status": 200, "language": "pt"}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -48,6 +51,16 @@ def fake_whisper(monkeypatch):
 
         def do_POST(self):
             body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            if state["status"] == 200 and b'name="language"' not in body:
+                state["detections"].append(body)
+                payload = json.dumps({"language": state["language"],
+                                      "segments": [{"start": 0.0, "end": 1.0, "text": " amostra"}]})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload.encode())
+                return
             state["requests"].append(body)
             n = len(state["requests"])
             payload = json.dumps({"segments": [{"start": 1.0, "end": 2.5, "text": f" bloco {n}"}]})
@@ -354,3 +367,60 @@ def test_transient_403_on_media_is_retried_once(dirs, tmp_path, monkeypatch):
         server.shutdown()
     assert len(downloads) == 2
     assert jobstore.load_job(job["id"], jobs)["state"] == "done"
+
+
+# ── v3 adjustments: automatic language, no speech ───────────────────────────
+
+
+def test_decide_language_by_majority_of_samples_with_speech():
+    assert worker.decide_language(["en", "pt", "en"]) == "en"
+    assert worker.decide_language([None, "pt", None]) == "pt"
+    assert worker.decide_language(["es", "pt"]) == "es"  # tie: the earliest
+    assert worker.decide_language([None, None, None]) is None
+
+
+@pytest.mark.parametrize("heard,prompt_ptbr", [("en", False), ("pt", True)])
+def test_auto_language_detects_on_three_samples_and_gates_the_brazilian_prompt(dirs, fake_whisper, heard, prompt_ptbr):
+    jobs, box = dirs
+    fake_whisper["language"] = heard
+    make_clip(box / "clip.mp4")
+    job = new_job(jobs, language=None)  # analyze_video's new default: "auto"
+    worker.process(job, root=jobs, inbox_root=box)
+    data = jobstore.load_job(job["id"], jobs)
+    assert data["state"] == "done" and data["language_detected"] == heard
+    assert data["language_votes"] == [heard] * 3 and len(fake_whisper["detections"]) == 3
+    for body in fake_whisper["requests"]:
+        assert form_field(body, "language") == heard
+        prompt = form_field(body, "prompt") or ""
+        assert ("português do Brasil" in prompt) is prompt_ptbr and "Joinville" in prompt
+    transcript = json.loads((jobstore.job_path(job["id"], jobs) / "transcript.json").read_text(encoding="utf-8"))
+    assert transcript["language"] == heard
+
+
+def test_explicit_language_skips_detection_and_resume_does_not_detect_again(dirs, fake_whisper):
+    jobs, box = dirs
+    make_clip(box / "clip.mp4")
+    job = new_job(jobs, language="pt")
+    worker.process(job, root=jobs, inbox_root=box)
+    assert fake_whisper["detections"] == []
+    auto = new_job(jobs, language=None, language_detected="en", language_votes=["en", None, "en"])
+    make_clip(box / "clip.mp4")
+    worker.process(auto, root=jobs, inbox_root=box)
+    assert fake_whisper["detections"] == []  # already decided before the restart
+    assert all(form_field(b, "language") == "en" for b in fake_whisper["requests"][-3:])
+
+
+def test_silent_media_is_no_speech_not_a_failure(dirs, fake_whisper, monkeypatch):
+    jobs, box = dirs
+    make_clip(box / "clip.mp4", seconds=25)
+    monkeypatch.setattr(worker, "transcribe_local", lambda *a, **k: [])
+    monkeypatch.setattr(worker, "detect_language_local", lambda *a, **k: (None, False))
+    job = new_job(jobs, language=None)
+    worker.process(job, root=jobs, inbox_root=box)
+    data = jobstore.load_job(job["id"], jobs)
+    assert data["state"] == "done" and data["speech"] is False and data["language_detected"] is None
+    monkeypatch.setattr(jobstore, "JOBS_DIR", jobs)
+    status = asyncio.run(mcp_server.job_status(job["id"]))
+    assert "sem fala no áudio" in status and "falhou" not in status
+    text = asyncio.run(mcp_server.watch_video(job_id=job["id"], detail="transcript"))[0].text
+    assert "Sem fala no áudio" in text

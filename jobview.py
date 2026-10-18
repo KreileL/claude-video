@@ -65,7 +65,9 @@ def status_text(job: dict, *, worker_ok: bool = True) -> str:
     if jobstore.as_number(job.get("duration")) > 0:
         lines.append(f"- Duração: {format_time(jobstore.as_number(job['duration']))}")
     if job.get("model"):
-        lines.append(f"- Modelo de transcrição: {job['model']} (idioma: {job.get('language') or 'automático'})")
+        lines.append(f"- Modelo de transcrição: {job['model']} (idioma: {language_label(job)})")
+    if job.get("speech") is False:
+        lines.append("- Transcrição: sem fala no áudio")
     eta = eta_text(job.get("eta_seconds")) if state == "running" else None
     if eta:
         lines.append(f"- Estimativa para terminar: {eta}")
@@ -79,6 +81,13 @@ def status_text(job: dict, *, worker_ok: bool = True) -> str:
         lines += ["", "**Aviso:** o watch-worker não está respondendo; o trabalho não vai andar. "
                       "Rode docker compose -p watch-mcp up -d"]
     return "\n".join(lines)
+
+
+def language_label(job: dict) -> str:
+    if job.get("language"):
+        return str(job["language"])
+    detected = job.get("language_detected")
+    return f"{detected} (detectado)" if detected else "automático"
 
 
 def entrada_lines(job: dict) -> list[str]:
@@ -210,6 +219,8 @@ def watch_text(job: dict, meta: dict, segments: list[dict], *, partial: bool, st
             warnings = [*warnings, "Transcrição do trecho cortada por tamanho: use start/end menores "
                                    "ou search_transcript para achar o ponto exato."]
         lines += ["", text]
+    elif job.get("speech") is False:
+        lines.append("_Sem fala no áudio._")
     else:
         lines.append("_Nenhuma fala transcrita neste trecho._")
     if partial:

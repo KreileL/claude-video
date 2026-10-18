@@ -43,6 +43,7 @@ import inbox
 import jobstore
 import netguard
 import textsearch
+import urlclean
 
 ROOT = Path(__file__).resolve().parent
 SCRIPTS_DIR = ROOT / "skills" / "watch" / "scripts"
@@ -133,6 +134,8 @@ class RunResult:
     frames: list[Frame] = field(default_factory=list)
     segments: list[dict] = field(default_factory=list)
     transcript_source: str | None = None
+    no_speech: bool = False  # Whisper heard no speech (not a failure)
+    no_audio: bool = False
     warnings: list[str] = field(default_factory=list)
     secrets: frozenset[str] = frozenset()
 
@@ -151,7 +154,8 @@ def check_time(name: str, value: str | None) -> str | None:
 
 def check_url(url: str) -> str:
     try:
-        return netguard.validate_url(url)
+        # Tracking parameters (igsh, dlrf, si, utm_*...) never reach job.json, notes or the cache key.
+        return urlclean.clean_url(netguard.validate_url(url))
     except netguard.BlockedURL as exc:
         raise ToolError(f"URL recusada: {exc}") from None
 
@@ -450,6 +454,7 @@ async def run_watch(
     start: str | None,
     end: str | None,
     ctx: Context | None,
+    language: str = "auto",
 ) -> tuple[RunResult, Path]:
     """Validate, preflight and run watch.py. The caller deletes the work dir."""
     deadline = time.monotonic() + CALL_TIMEOUT
@@ -498,6 +503,7 @@ async def run_watch(
             env = child_env({
                 "WATCH_YTDLP_ARGS": json.dumps(extra),
                 "WATCH_YTDLP_TIMEOUT": str(YTDLP_TIMEOUT),
+                **({"WATCH_WHISPER_LANGUAGE": language} if language != "auto" else {}),
             })
             try:
                 code, stdout, stderr = await run_process(
@@ -519,8 +525,12 @@ async def run_watch(
         result = RunResult(info=info, frames=parse_frames(stdout, run_dir / "frames"), secrets=secrets)
         result.segments, result.transcript_source = read_transcript(run_dir)
         for line in stderr.splitlines():
-            if "whisper fallback failed" in line:
+            if "whisper fallback failed" in line and NO_SPEECH_MARK in line:
+                result.no_speech = True  # silence or music: not an error
+            elif "whisper fallback failed" in line:
                 result.warnings.append(f"Transcrição Whisper falhou: {scrub(line.split('failed:', 1)[-1].strip(), secrets)}")
+            elif "no audio stream found" in line:
+                result.no_audio = True
             elif "no audio stream found" in line:
                 result.warnings.append("O vídeo não tem trilha de áudio.")
         return result, work
@@ -581,6 +591,25 @@ def encode_frames(frames: list[Frame], budget: int) -> tuple[list[Frame], list[s
     return [frames[i] for i in picks], [encoded[i] for i in picks], note
 
 
+NO_SPEECH_MARK = "returned no transcript segments"  # whisper.py, when it heard nothing
+NO_SPEECH_TEXT = "Sem fala no áudio."
+
+
+def no_transcript_text(result: RunResult) -> str:
+    if result.no_speech:
+        return f"_{NO_SPEECH_TEXT}_"
+    if result.no_audio:
+        return "_O vídeo não tem áudio._"
+    return "_Nenhuma transcrição disponível (sem legendas, e o Whisper não transcreveu; veja os avisos)._"
+
+
+def check_language(language: str | None) -> str:
+    language = (language or "auto").strip().lower()
+    if language != "auto" and not LANGUAGE_RE.match(language):
+        raise ToolError('language deve ser um código de 2 letras (ex.: "pt") ou "auto"')
+    return language
+
+
 def build_text(
     url: str,
     result: RunResult,
@@ -624,7 +653,7 @@ def build_text(
         lines.append(f"_Fonte: {result.transcript_source or 'captions'}_")
         lines += ["", format_transcript(result.segments)]
     else:
-        lines.append("_Nenhuma transcrição disponível (sem legendas e sem fala reconhecida)._")
+        lines.append(no_transcript_text(result))
 
     if frames is not None:
         lines += ["", f"## Frames ({len(frames)}, em ordem temporal — as imagens seguem nesta ordem)", ""]
@@ -650,6 +679,7 @@ async def watch_video(
     detail: Literal["transcript", "efficient", "balanced"] = "balanced",
     max_frames: int = 24,
     job_id: str | None = None,
+    language: str = "auto",
     ctx: Context | None = None,
 ) -> list[TextContent | ImageContent]:
     """Watch a video: a short one from a URL, or a range of an analyzed job.
@@ -661,15 +691,18 @@ async def watch_video(
     Returns metadata, a transcript with timestamps, and frames as JPEG images in
     temporal order (t=MM:SS listed in the text). `start`/`end` (SS, MM:SS or
     HH:MM:SS) focus on a range; `detail`: "transcript" (no frames), "efficient"
-    (scene cuts/keyframes, cheapest) or "balanced" (default).
+    (scene cuts/keyframes, cheapest) or "balanced" (default). `language`: "auto"
+    (default, Whisper detects it) or a 2-letter code to force it.
     """
+    language = check_language(language)
     if not 1 <= max_frames <= MAX_FRAMES_LIMIT:
         raise ToolError(f"max_frames deve estar entre 1 e {MAX_FRAMES_LIMIT}")
     if (url is None) == (job_id is None):
         raise ToolError("Informe url (vídeo curto) ou job_id (trabalho de analyze_video), um dos dois.")
     if job_id is not None:
         return watch_job(job_id, question=question, start=start, end=end, detail=detail, max_frames=max_frames)
-    result, work = await run_watch(url, detail=detail, max_frames=max_frames, start=start, end=end, ctx=ctx)
+    result, work = await run_watch(url, detail=detail, max_frames=max_frames, start=start, end=end, ctx=ctx,
+                                   language=language)
     try:
         frames, encoded, note = [], [], None
         if detail != "transcript":
@@ -688,14 +721,17 @@ async def watch_video(
 
 
 @mcp.tool()
-async def transcribe_video(url: str, ctx: Context | None = None) -> str:
+async def transcribe_video(url: str, language: str = "auto", ctx: Context | None = None) -> str:
     """Transcribe a video from a URL (captions when available, else local Whisper).
 
     Text only — metadata, post caption and a timestamped transcript, no frames.
+    `language`: "auto" (default) or a 2-letter code to force it.
     """
-    result, work = await run_watch(url, detail="transcript", max_frames=1, start=None, end=None, ctx=ctx)
+    language = check_language(language)
+    result, work = await run_watch(url, detail="transcript", max_frames=1, start=None, end=None, ctx=ctx,
+                                   language=language)
     try:
-        if not result.segments:
+        if not result.segments and not (result.no_speech or result.no_audio):
             raise ToolError(
                 "Nenhuma transcrição obtida: o vídeo não tem legendas e o Whisper não reconheceu fala."
                 + (f" ({'; '.join(result.warnings)})" if result.warnings else "")
@@ -753,7 +789,7 @@ def inbox_source(name: str) -> tuple[str, list]:
 @mcp.tool()
 async def analyze_video(
     source: str,
-    language: str = "pt",
+    language: str = "auto",
     quality: Literal["auto", "fast", "accurate"] = "auto",
     terms: list[str] | None = None,
 ) -> str:
@@ -761,8 +797,9 @@ async def analyze_video(
 
     `source`: a URL (same rules as watch_video) or the name of a file in the
     inbox (see list_inbox; just the name, no folders). Videos up to 4 hours.
-    `language`: Whisper language code, "pt" by default (Brazilian Portuguese
-    context is added to the prompt), or "auto". `quality`: "auto" (fast model for
+    `language`: "auto" by default (detected by majority over 3 speech samples;
+    Brazilian Portuguese context only when it decides pt) or a 2-letter code to
+    force it. `quality`: "auto" (fast model for
     short videos, the most accurate pt-BR model for long ones), "fast" or
     "accurate". `terms`: optional proper names/jargon that appear in the video,
     to help the transcription. Then poll job_status(job_id).
@@ -785,16 +822,14 @@ async def analyze_video(
 ORIGINS = ("mcp", "telegram")
 
 
-def enqueue_analysis(source: str, language: str = "pt", quality: str = "auto",
+def enqueue_analysis(source: str, language: str = "auto", quality: str = "auto",
                      terms: list[str] | None = None, *, origin: str = "mcp") -> tuple[dict, bool]:
     """Validate and enqueue one analysis; returns (job, reused). The only way in for
     analyze_video and the Telegram bot (no parallel path). Raises ToolError."""
     source = (source or "").strip()
     if not source:
         raise ToolError("Informe source: uma URL ou o nome de um arquivo da caixa de entrada.")
-    language = (language or "pt").strip().lower()
-    if language != "auto" and not LANGUAGE_RE.match(language):
-        raise ToolError('language deve ser um código de 2 letras (ex.: "pt") ou "auto"')
+    language = check_language(language)
     if quality not in ("auto", "fast", "accurate"):
         raise ToolError('quality deve ser "auto", "fast" ou "accurate"')
     if origin not in ORIGINS:

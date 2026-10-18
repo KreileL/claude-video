@@ -49,7 +49,7 @@ import mcp_server
 import netguard
 import postproc
 import textsearch
-from whisper import transcribe_local
+from whisper import detect_language_local, transcribe_local
 
 MAX_DURATION = float(os.environ.get("WATCH_JOB_MAX_DURATION", str(4 * 3600)))
 MAX_DOWNLOAD_BYTES = int(os.environ.get("WATCH_JOB_MAX_DOWNLOAD_BYTES", str(4 * 1024**3)))
@@ -78,6 +78,8 @@ PROMPT_PTBR = (
     "ônibus, celular, time, trem, registro, boleto, aluguel, a gente, tô, cê."
 )
 PROMPT_LIMIT = 800  # characters; Whisper only keeps the last ~224 prompt tokens
+LANG_SAMPLES = (0.2, 0.5, 0.8)  # language="auto": where (fraction of the audio) to sample
+LANG_SAMPLE_SECONDS = 30.0  # Whisper detects the language from the first 30 s it hears
 FRAME_LONG_SIDE = mcp_server.FRAME_LONG_SIDE
 # Index size: one grid frame at least every duration/MAX_INDEX_FRAMES s (≥ 2 s)
 # and scene cuts no closer than half that, so a job never exceeds
@@ -267,6 +269,46 @@ def build_prompt(language: str | None, terms: list[str]) -> str | None:
     if language != "pt":
         return ", ".join(terms)[:PROMPT_LIMIT]
     return f"{PROMPT_PTBR} Termos: {', '.join(terms)}."[:PROMPT_LIMIT]
+
+
+def decide_language(votes: list[str | None]) -> str | None:
+    """Majority of the samples that had speech; a tie goes to the earliest of the
+    tied languages. None when no sample had speech (Whisper then detects per chunk)."""
+    heard = [v for v in votes if v]
+    if not heard:
+        return None
+    best = max(heard.count(v) for v in heard)
+    return next(v for v in heard if heard.count(v) == best)
+
+
+def detect_language(job: "Job", duration: float) -> str | None:
+    """language="auto": detect on 3 speech samples spread over the audio and decide
+    by majority (one 30 s guess at the start can be music or an intro). Persisted,
+    so a resumed job does not detect again."""
+    if "language_detected" in job.data:
+        return job.data["language_detected"]
+    votes: list[str | None] = []
+    room = ensure_room(job, int(LANG_SAMPLE_SECONDS * AUDIO_BYTES_PER_SECOND * 1.2) + 200_000)
+    for i, at in enumerate(LANG_SAMPLES):
+        start = max(0.0, min(duration * at, duration - LANG_SAMPLE_SECONDS))
+        end = min(duration, start + LANG_SAMPLE_SECONDS)
+        if end - start < 1.0:
+            continue
+        piece = cut_audio(job, start, end, f"lang_{i}", room)
+        try:
+            left = job.remaining()
+            code, speech = within(left, lambda: detect_language_local(
+                piece, model=MODEL_FAST, deadline=time.monotonic() + left))
+        except SystemExit as exc:
+            log(f"{job.id}: language sample {i + 1} failed ({exc}); skipped")
+            code, speech = None, False
+        finally:
+            piece.unlink(missing_ok=True)
+        votes.append(code if speech else None)
+    decided = decide_language(votes)
+    job.update(language_detected=decided, language_votes=votes)
+    log(f"{job.id}: language votes {votes} -> {decided or 'per chunk'}")
+    return decided
 
 
 def scale_filter() -> str:
@@ -601,7 +643,8 @@ def transcribe(job: Job) -> None:
     chunk_dir.mkdir(exist_ok=True)
     duration = float(plan.get("duration") or 0)
     model = job.data.get("model") or pick_model(job.data.get("quality", "auto"), duration)
-    language = job.data.get("language")
+    language = job.data.get("language") or detect_language(job, duration)  # explicit wins over auto
+    # The Brazilian context only goes in when the decided language is pt.
     prompt = build_prompt(language, job.data.get("terms") or [])
     job.update(model=model, chunks_total=len(chunks), prompt_used=bool(prompt))
     started = time.monotonic()
@@ -641,6 +684,7 @@ def transcribe(job: Job) -> None:
     jobstore.write_json_atomic(job.dir / "transcript.json", {
         "segments": segments, "model": model, "language": language, "prompt_used": bool(prompt),
     })
+    job.update(speech=bool(segments))  # False: silence/music, said as "sem fala no áudio"
 
 
 def cut_audio(job: Job, start: float, end: float, name: str, room: int) -> Path:
