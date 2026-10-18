@@ -25,6 +25,7 @@ JOBS_DIR = Path(os.environ.get("WATCH_JOBS_DIR", "/jobs"))
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 STATES = ("queued", "running", "done", "failed")
 ORPHAN_AGE = 3600.0
+ARCHIVED = "archived"  # v3: exported to the Holocron; never expires (v2 cleanup also skips it)
 # Touched by the worker every few seconds; not a job dir, so every scan skips it.
 HEARTBEAT_FILE = ".heartbeat"
 
@@ -170,9 +171,9 @@ def as_number(v: Any) -> float:
 
 
 def find_cached(cache_key: str, root: Path | None = None) -> dict | None:
-    """Newest queued/running/done job with this cache_key."""
+    """Newest queued/running/done/archived job with this cache_key."""
     for job in list_jobs(root):
-        if job.get("cache_key") == cache_key and job.get("state") in ("queued", "running", "done"):
+        if job.get("cache_key") == cache_key and job.get("state") in ("queued", "running", "done", ARCHIVED):
             return job
     return None
 
@@ -212,7 +213,7 @@ def cleanup(root: Path | None = None, *, ttl_seconds: float, max_bytes: int,
             now: float | None = None) -> list[str]:
     """Delete expired/over-cap finished jobs and stale orphan dirs; returns removed ids.
 
-    Never touches queued or running jobs.
+    Never touches queued, running or archived jobs.
     """
     now = time.time() if now is None else now
     removed: list[str] = []
@@ -229,6 +230,8 @@ def cleanup(root: Path | None = None, *, ttl_seconds: float, max_bytes: int,
             if age > ORPHAN_AGE and _remove(entry.path):
                 removed.append(name)
             continue
+        if job.get("state") == ARCHIVED:
+            continue  # v3: archived jobs are kept forever and do not count against the cap
         if job.get("state") not in ("done", "failed"):
             sizes[name] = dir_size(Path(entry.path))
             continue

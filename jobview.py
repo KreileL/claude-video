@@ -20,7 +20,10 @@ SEARCH_TEXT_LIMIT = 40_000
 HIT_TEXT_LIMIT = 500
 TITLE_LIMIT = 300
 HEARTBEAT_STALE = 90.0
-STATE_PT = {"queued": "na fila", "running": "processando", "done": "concluído", "failed": "falhou"}
+STATE_PT = {"queued": "na fila", "running": "processando", "done": "concluído", "failed": "falhou",
+            "archived": "arquivado"}
+READY_STATES = ("done", "archived")
+ENTRADA_LABEL = "00 - Entrada"
 
 
 def clip(text, limit: int) -> str:
@@ -66,15 +69,30 @@ def status_text(job: dict, *, worker_ok: bool = True) -> str:
     eta = eta_text(job.get("eta_seconds")) if state == "running" else None
     if eta:
         lines.append(f"- Estimativa para terminar: {eta}")
+    lines += entrada_lines(job)
     if state == "failed":
         lines += ["", f"**Erro:** {job.get('error') or 'desconhecido'}"]
-    elif state == "done":
+    elif state in READY_STATES:
         lines += ["", "Pronto: use search_transcript(job_id, query) para achar trechos e "
                       "watch_video(job_id=..., start=..., end=...) para ver frames e a transcrição de um trecho."]
     if state in ("queued", "running") and not worker_ok:
         lines += ["", "**Aviso:** o watch-worker não está respondendo; o trabalho não vai andar. "
                       "Rode docker compose -p watch-mcp up -d"]
     return "\n".join(lines)
+
+
+def entrada_lines(job: dict) -> list[str]:
+    """v3: where the job's note went in the Holocron and the summary state."""
+    lines = []
+    if job.get("entrada_folder"):
+        lines.append(f"- Nota no Holocron: {ENTRADA_LABEL}/{clip(job['entrada_folder'], 200)}")
+    elif job.get("export") == "pendente":
+        lines.append("- Nota no Holocron: pendente (a pasta de entrada não estava acessível; o worker tenta de novo)")
+    if job.get("resumo"):
+        lines.append(f"- Resumo: {job['resumo']}")
+    if job.get("state") == "archived":
+        lines.append("- Arquivado: sim (fica no worker sem prazo, sem o vídeo)")
+    return lines
 
 
 def job_line(job: dict) -> str:
@@ -88,7 +106,8 @@ def job_line(job: dict) -> str:
     progress = f" {jobstore.as_number(job.get('progress')):.0f}%" if job.get("state") == "running" else ""
     title = (f" — {clip(job['title'], 120)}" if job.get("title")
              and job.get("title") != (job.get("source") or {}).get("value") else "")
-    return f"- `{job['id']}` {state}{progress} · {duration} · {created} · {source_label(job)}{title}"
+    note = f" · nota: {clip(job['entrada_folder'], 120)}" if job.get("entrada_folder") else ""
+    return f"- `{job['id']}` {state}{progress} · {duration} · {created} · {source_label(job)}{title}{note}"
 
 
 def _usable(segments) -> list[dict]:

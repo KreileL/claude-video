@@ -765,6 +765,28 @@ async def analyze_video(
     "accurate". `terms`: optional proper names/jargon that appear in the video,
     to help the transcription. Then poll job_status(job_id).
     """
+    job, reused = await asyncio.to_thread(enqueue_analysis, source, language, quality, terms, origin="mcp")
+    if reused:
+        return ("Este vídeo já foi analisado (ou está em andamento) com os mesmos parâmetros; reaproveitando.\n\n"
+                + jobview.status_text(job, worker_ok=jobview.worker_alive()))
+    text = (
+        f"Trabalho criado: job_id = {job['id']}\n\n"
+        "Ele roda em segundo plano (de minutos a horas, conforme a duração). Acompanhe com "
+        "job_status(job_id); quando concluir, use search_transcript e watch_video(job_id=...). "
+        "A nota com o resumo aparece sozinha em 00 - Entrada no Holocron."
+    )
+    if not jobview.worker_alive():
+        text += "\n\n**Aviso:** o watch-worker não está respondendo. Rode docker compose -p watch-mcp up -d"
+    return text
+
+
+ORIGINS = ("mcp", "telegram")
+
+
+def enqueue_analysis(source: str, language: str = "pt", quality: str = "auto",
+                     terms: list[str] | None = None, *, origin: str = "mcp") -> tuple[dict, bool]:
+    """Validate and enqueue one analysis; returns (job, reused). The only way in for
+    analyze_video and the Telegram bot (no parallel path). Raises ToolError."""
     source = (source or "").strip()
     if not source:
         raise ToolError("Informe source: uma URL ou o nome de um arquivo da caixa de entrada.")
@@ -773,20 +795,23 @@ async def analyze_video(
         raise ToolError('language deve ser um código de 2 letras (ex.: "pt") ou "auto"')
     if quality not in ("auto", "fast", "accurate"):
         raise ToolError('quality deve ser "auto", "fast" ou "accurate"')
+    if origin not in ORIGINS:
+        raise ToolError("origem inválida")
     terms = check_terms(terms)
     if source.lower().startswith(("http://", "https://")):
         value, fingerprint, kind = check_url(source), [], "url"
     elif "://" in source:
         raise ToolError("URL recusada: só http/https")
+    elif origin != "mcp":
+        raise ToolError("só links http/https")  # the inbox is for the local MCP client only
     else:
-        (value, fingerprint), kind = await asyncio.to_thread(inbox_source, source), "inbox"
+        (value, fingerprint), kind = inbox_source(source), "inbox"
     key = hashlib.sha256(json.dumps(
         [kind, value, fingerprint, language, quality, sorted(terms)], ensure_ascii=False,
     ).encode()).hexdigest()
     cached = jobstore.find_cached(key)
     if cached is not None:
-        return ("Este vídeo já foi analisado (ou está em andamento) com os mesmos parâmetros; reaproveitando.\n\n"
-                + jobview.status_text(cached, worker_ok=jobview.worker_alive()))
+        return cached, True
     job = jobstore.create_job({
         "source": {"kind": kind, "value": value},
         "language": None if language == "auto" else language,
@@ -795,15 +820,9 @@ async def analyze_video(
         "cache_key": key,
         # What the server saw (inbox: size + mtime); the worker refuses a changed file.
         "fingerprint": fingerprint or None,
+        "origin": origin,
     })
-    text = (
-        f"Trabalho criado: job_id = {job['id']}\n\n"
-        "Ele roda em segundo plano (de minutos a horas, conforme a duração). Acompanhe com "
-        "job_status(job_id); quando concluir, use search_transcript e watch_video(job_id=...)."
-    )
-    if not jobview.worker_alive():
-        text += "\n\n**Aviso:** o watch-worker não está respondendo. Rode docker compose -p watch-mcp up -d"
-    return text
+    return job, False
 
 
 @mcp.tool()
