@@ -208,9 +208,12 @@ def test_export_refuses_unfinished_or_locked_jobs(env):
     with pytest.raises(entrada.EntradaError):
         postproc.run_export(running)
     jid = done_job(jobs)
-    (jobs / jid / postproc.LOCK_NAME).write_text("1")
-    with pytest.raises(postproc.Busy):
-        postproc.run_export(jid)
+    held = jobstore.try_lock_job(jobs / jid)  # another process exporting it
+    try:
+        with pytest.raises(postproc.Busy):
+            postproc.run_export(jid)
+    finally:
+        jobstore.release_job(held)
     assert worker.export_cli(["nao-e-um-id"]) == 1
 
 
@@ -344,8 +347,11 @@ def test_p1_a_locked_job_is_skipped_by_cleanup(env):
     jobs, _, _ = env
     jid = done_job(jobs)
     legacy(jobs, jid)
-    (jobs / jid / jobstore.EXPORT_LOCK).write_text("1")
-    assert jobstore.cleanup(jobs, ttl_seconds=1, max_bytes=0, now=time.time() + 10**7) == []
+    held = jobstore.try_lock_job(jobs / jid)
+    try:
+        assert jobstore.cleanup(jobs, ttl_seconds=1, max_bytes=0, now=time.time() + 10**7) == []
+    finally:
+        jobstore.release_job(held)
 
 
 def test_p1_second_exporter_waits_for_the_lock_and_sees_fresh_state(env, monkeypatch):
@@ -518,10 +524,10 @@ def test_p2_finish_finding_the_lock_busy_leaves_a_finished_export_alone(env):
     jobs, vault, _ = env
     jid = done_job(jobs)
     assert postproc.run_export(jid)  # the manual export published and recorded "ok"...
-    (jobs / jid / postproc.LOCK_NAME).write_text("1")  # ...and still holds its lock
+    held = jobstore.try_lock_job(jobs / jid)  # ...and still holds its lock
     postproc.finish(jid)
     assert jobstore.load_job(jid, jobs)["export"] == "ok"
-    (jobs / jid / postproc.LOCK_NAME).unlink()
+    jobstore.release_job(held)
     postproc.retry_due(now=time.time() + 10**7)
     assert len(user_folders(vault)) == 1
 
@@ -603,14 +609,13 @@ def test_p2_long_titles_do_not_hide_the_delivery_marker(env, monkeypatch):
     assert sorted(p.name for p in folder_of(vault, jid).glob("Resumo*.md")) == ["Resumo.md"]
 
 
-def test_p2_a_stale_cleanup_claim_is_recovered(env):
+def test_p2_a_lock_file_left_by_a_dead_process_does_not_block(env):
+    # Codex v3 pass 3: no age-based reaping any more (it raced); an OS lock dies with
+    # its process, so an old lock file without a holder is simply free.
     jobs, _, _ = env
     jid = done_job(jobs)
     legacy(jobs, jid)
-    lock = jobs / jid / jobstore.EXPORT_LOCK
-    lock.write_text("1")
-    old = time.time() - 2 * jobstore.LOCK_STALE
-    os.utime(lock, (old, old))
+    (jobs / jid / jobstore.EXPORT_LOCK).write_text("pid 12345")
     assert jobstore.cleanup(jobs, ttl_seconds=1, max_bytes=0, now=time.time() + 10**7) == [jid]
 
 
@@ -622,3 +627,70 @@ def test_p2_pending_note_says_how_to_retry_if_the_provider_refuses(env, monkeypa
     postproc.finish(jid)
     note = (folder_of(vault, jid) / "Meu vídeo.md").read_text(encoding="utf-8")
     assert "Resumo pendente" in note and f"export {jid} --again" in note
+
+
+# ── Codex v3 pass 3 ─────────────────────────────────────────────────────────
+
+
+def test_p3_cleanup_cannot_remove_a_job_while_an_exporter_holds_the_lock(env, monkeypatch):
+    """The race of pass 3: the old lock file is never deleted to take ownership, so a
+    cleanup that looked at it earlier cannot steal the exporter's lock."""
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    legacy(jobs, jid)
+    (jobs / jid / jobstore.EXPORT_LOCK).write_text("left by a dead process")
+    seen = {}
+
+    def during_export(segments, **kw):
+        seen["removed"] = jobstore.cleanup(jobs, ttl_seconds=1, max_bytes=0, now=time.time() + 10**7)
+        return resumo.Summary(SUMMARY, "gemini", "m", 1)
+
+    monkeypatch.setattr(resumo, "summarize", during_export)
+    assert postproc.run_export(jid)
+    assert seen["removed"] == [] and (jobs / jid / "transcript.json").exists()
+    assert (jobs / jid / jobstore.EXPORT_LOCK).exists()  # never deleted
+
+
+def test_p3_two_exporters_never_both_publish(env, monkeypatch):
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    (jobs / jid / jobstore.EXPORT_LOCK).write_text("left by a dead process")
+    calls = []
+
+    def during_first(segments, **kw):
+        calls.append(1)
+        with pytest.raises(postproc.Busy):
+            postproc.run_export(jid)
+        return resumo.Summary(SUMMARY, "gemini", "m", 1)
+
+    monkeypatch.setattr(resumo, "summarize", during_first)
+    postproc.run_export(jid)
+    assert len(user_folders(vault)) == 1 and calls == [1]
+
+
+def test_p3_huge_titles_do_not_hide_the_export_id(env, monkeypatch):
+    jobs, vault, _ = env
+    jid = done_job(jobs, title="T" * 8300)
+    real = postproc._mark_exported
+    monkeypatch.setattr(postproc, "_mark_exported", lambda *a, **k: (_ for _ in ()).throw(OSError("parou")))
+    with pytest.raises(OSError):
+        postproc.run_export(jid)
+    monkeypatch.setattr(postproc, "_mark_exported", real)
+    postproc.retry_due(now=time.time() + 10**7)
+    assert len(user_folders(vault)) == 1
+
+
+def test_p3_again_after_an_unrecorded_publish_adopts_it(env, monkeypatch):
+    """Chosen semantics: --again makes a new version of a job whose export was recorded;
+    a publish that crashed before being recorded is adopted (no duplicate)."""
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    real = postproc._mark_exported
+    monkeypatch.setattr(postproc, "_mark_exported", lambda *a, **k: (_ for _ in ()).throw(OSError("parou")))
+    with pytest.raises(OSError):
+        postproc.run_export(jid)
+    monkeypatch.setattr(postproc, "_mark_exported", real)
+    assert postproc.run_export(jid, again=True)
+    assert len(user_folders(vault)) == 1
+    assert postproc.run_export(jid, again=True)  # now recorded: a real new version
+    assert len(user_folders(vault)) == 2

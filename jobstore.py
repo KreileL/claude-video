@@ -26,8 +26,7 @@ JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 STATES = ("queued", "running", "done", "failed")
 ORPHAN_AGE = 3600.0
 ARCHIVED = "archived"  # v3: exported to the Holocron; never expires (v2 cleanup also skips it)
-EXPORT_LOCK = ".export.lock"
-LOCK_STALE = 3600.0  # v3: held by the exporter, and by cleanup while it removes a job
+EXPORT_LOCK = ".export.lock"  # v3: held by the exporter, and by cleanup while it removes a job
 # Touched by the worker every few seconds; not a job dir, so every scan skips it.
 HEARTBEAT_FILE = ".heartbeat"
 
@@ -217,29 +216,55 @@ def _evictable(job: dict | None) -> bool:
             and job.get("export") != "pendente")
 
 
-def _claim(path: str, name: str) -> bool:
-    """Take the job's export lock (exclusive create), then re-check on disk that the
-    job may still be removed. The exporter holds the same lock, so a job is never
-    deleted while it is being exported. The lock goes away with the directory."""
-    lock = os.path.join(path, EXPORT_LOCK)
+def try_lock_job(job_dir: Path) -> int | None:
+    """The job's exclusive lock: an OS lock on <job>/.export.lock (flock in the Linux
+    container, msvcrt.locking on Windows test runs). Released by close() or by the
+    kernel when the process dies, so a dead holder never needs reaping, and the file
+    is never deleted to take ownership (that raced in Codex v3 pass 3). Returns the
+    fd, or None when someone else holds it. FileNotFoundError: the job is gone."""
+    fd = os.open(Path(job_dir) / EXPORT_LOCK, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
-        if time.time() - os.lstat(lock).st_mtime > LOCK_STALE:
-            os.unlink(lock)  # left by a process that died (an export never takes this long)
+        try:
+            import fcntl
+        except ImportError:
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def release_job(fd: int) -> None:
+    try:
+        os.close(fd)  # drops the lock
     except OSError:
         pass
+
+
+def _remove_claimed(path: str, name: str) -> bool:
+    """Remove a job only while holding its lock, after re-checking on disk that it
+    may still go: the exporter holds the same lock, so a job is never deleted while
+    it is being exported."""
     try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        fd = try_lock_job(Path(path))
     except OSError:
         return False
-    os.close(fd)
+    if fd is None:
+        return False
     job = read_json(Path(path) / "job.json")
-    if _evictable(job if job is not None and job.get("id") == name else None):
-        return True
+    if not _evictable(job if job is not None and job.get("id") == name else None):
+        release_job(fd)
+        return False
+    if os.name == "nt":  # Windows cannot delete an open file (test runs only)
+        release_job(fd)
+        return _remove(path)
     try:
-        os.unlink(lock)
-    except OSError:
-        pass
-    return False
+        return _remove(path)
+    finally:
+        release_job(fd)
 
 
 def cleanup(root: Path | None = None, *, ttl_seconds: float, max_bytes: int,
@@ -270,7 +295,7 @@ def cleanup(root: Path | None = None, *, ttl_seconds: float, max_bytes: int,
             continue
         updated = as_number(job.get("updated"))
         if now - updated > ttl_seconds:
-            if _claim(entry.path, name) and _remove(entry.path):
+            if _remove_claimed(entry.path, name):
                 removed.append(name)
             continue
         sizes[name] = dir_size(Path(entry.path))
@@ -280,7 +305,7 @@ def cleanup(root: Path | None = None, *, ttl_seconds: float, max_bytes: int,
     for _updated, name, path in sorted(finished):
         if total <= max_bytes:
             break
-        if _claim(path, name) and _remove(path):
+        if _remove_claimed(path, name):
             removed.append(name)
             total -= sizes[name]
     return removed

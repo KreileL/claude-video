@@ -37,7 +37,6 @@ EXPORT_RETRY = float(os.environ.get("WATCH_EXPORT_RETRY_FIRST", "300"))
 EXPORT_RETRY_MAX = 3600.0
 LOCK_NAME = jobstore.EXPORT_LOCK
 RESERVED_NOTES = ("transcrição.md", "resumo.md")  # our fixed file names, compared casefolded
-LOCK_STALE = jobstore.LOCK_STALE
 SUMMARY_FILE = "summary.json"
 SUMMARY_FRAMES = 6
 HIGHLIGHTS = 8
@@ -55,24 +54,20 @@ class Busy(Exception):
 # ── helpers ────────────────────────────────────────────────────────────────
 
 
-def _lock(job_dir: Path) -> Path:
-    """The job's exclusive lock, shared with jobstore.cleanup (which never removes a
+def _lock(job_dir: Path) -> int:
+    """The job's exclusive OS lock, shared with jobstore.cleanup (which never removes a
     locked job). Taken BEFORE reading job.json, so every decision uses fresh state."""
     if jobstore.is_link(job_dir) or not job_dir.is_dir():
         raise jobstore.JobError("trabalho não encontrado")
-    path = job_dir / LOCK_NAME
     try:
-        if time.time() - os.lstat(path).st_mtime > LOCK_STALE:
-            path.unlink()
-    except FileNotFoundError:
-        pass
-    try:
-        entrada.create_file(path, str(os.getpid()))
-    except FileExistsError:
-        raise Busy("exportação já em andamento para este trabalho") from None
+        fd = jobstore.try_lock_job(job_dir)
     except FileNotFoundError:
         raise jobstore.JobError("trabalho não encontrado") from None
-    return path
+    except OSError:
+        raise Busy("trava do trabalho indisponível") from None
+    if fd is None:
+        raise Busy("exportação já em andamento para este trabalho")
+    return fd
 
 
 def _casefold(name: str) -> str:
@@ -364,7 +359,7 @@ def run_export(job_id: str, root: Path | None = None, entrada_root: Path | None 
             pass
         raise
     finally:
-        lock.unlink(missing_ok=True)
+        jobstore.release_job(lock)
 
 
 def _delivered(entrada_root: Path | None, folder: str, job_id: str) -> str | None:
@@ -427,7 +422,7 @@ def add_late_summary(job_id: str, root: Path | None = None, entrada_root: Path |
                                 + _backoff(attempts, EXPORT_RETRY, EXPORT_RETRY_MAX))
             log(f"{job_id}: entrega do resumo adiada ({type(exc).__name__})")
     finally:
-        lock.unlink(missing_ok=True)
+        jobstore.release_job(lock)
 
 
 def finish(job_id: str, root: Path | None = None, entrada_root: Path | None = None) -> None:
