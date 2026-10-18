@@ -32,7 +32,7 @@ def docker_args(home: Path | None = None, extra_env: dict[str, str] | None = Non
         "-e", f"WATCH_WHISPER_MODEL={WHISPER_MODEL}",
         "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=1g",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-        "--memory", "2g", "--pids-limit", "256",
+        "--memory", "2g", "--pids-limit", "256", "--cpus", "4",
         "--mount", f"type=bind,src={secrets},dst=/secrets,readonly",
     ]
     for key, value in (extra_env or {}).items():

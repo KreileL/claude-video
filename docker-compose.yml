@@ -12,6 +12,8 @@ services:
     image: ghcr.io/speaches-ai/speaches:0.8.3-cpu@sha256:21e3df06d842fb7802ab470dd77c25f0e8c0d22950e8d8c6ae886e851af53ef8
     container_name: watch-mcp-whisper
     restart: unless-stopped
+    # The image's own non-root "ubuntu" user, made explicit (it owns the model volume).
+    user: "1000:1000"
     environment:
       # Unload idle models (STT and TTS share this TTL in speaches 0.8.x).
       WHISPER__TTL: "120"
