@@ -279,3 +279,45 @@ def test_job_that_keeps_crashing_the_worker_is_failed(dirs):
     worker.process(jobstore.load_job(job["id"], jobs), root=jobs, inbox_root=box)
     data = jobstore.load_job(job["id"], jobs)
     assert data["state"] == "failed" and "interrompido" in data["error"]
+
+
+def seg(start, text):
+    return {"start": start, "end": start + 1.0, "text": text}
+
+
+def test_repetition_loop_detection():
+    normal = [seg(i, f"frase número {i} sobre a safra") for i in range(10)]
+    assert not worker.looks_repetitive(normal)
+    looped = normal[:3] + [seg(10 + i, "É do Léo mesmo.") for i in range(5)]
+    assert worker.looks_repetitive(looped)
+    one_long = [seg(0, "é do léo mesmo " * 30)]
+    assert worker.looks_repetitive(one_long)
+    assert not worker.looks_repetitive([seg(0, "Não ri não."), seg(1, "Não ri não."), seg(2, "Tá bom.")])
+
+
+def test_collapse_repeats_keeps_at_most_two():
+    segs = [seg(0, "a"), seg(1, "É do Léo mesmo."), seg(2, "é do léo mesmo"), seg(3, "É do Léo mesmo!"),
+            seg(4, "É do Léo mesmo."), seg(5, "fim")]
+    assert [s["start"] for s in worker.collapse_repeats(segs)] == [0, 1, 2, 5]
+
+
+def test_looping_chunk_is_retranscribed_in_short_pieces(dirs, monkeypatch):
+    jobs, box = dirs
+    make_clip(box / "clip.mp4", seconds=40)
+    monkeypatch.setattr(worker, "CHUNK_SECONDS", 300.0)
+    monkeypatch.setattr(worker, "LOOP_PIECE_SECONDS", 15.0)
+    calls = []
+
+    def fake(path, **kwargs):
+        calls.append(path.name)
+        if len(calls) == 1:  # the whole chunk loops
+            return [seg(i, "É do Léo mesmo.") for i in range(20)]
+        return [seg(0.5, f"pedaço {len(calls)}")]
+
+    monkeypatch.setattr(worker, "transcribe_local", fake)
+    job = new_job(jobs)
+    worker.process(job, root=jobs, inbox_root=box)
+    assert jobstore.load_job(job["id"], jobs)["state"] == "done"
+    segments = json.loads((jobstore.job_path(job["id"], jobs) / "transcript.json").read_text(encoding="utf-8"))["segments"]
+    assert [s["text"] for s in segments] == ["pedaço 2", "pedaço 3", "pedaço 4"]
+    assert [s["start"] for s in segments] == [0.5, 15.5, 30.5]

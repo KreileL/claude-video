@@ -32,6 +32,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import zlib
 from pathlib import Path
 
 import chunking
@@ -39,6 +40,7 @@ import inbox
 import jobstore
 import mcp_server
 import netguard
+import textsearch
 from whisper import transcribe_local
 
 MAX_DURATION = float(os.environ.get("WATCH_JOB_MAX_DURATION", str(4 * 3600)))
@@ -65,6 +67,14 @@ SCENE_THRESHOLD = 0.3
 WHISPER_RETRIES = (30, 60, 120)  # seconds to wait before each retry of a chunk
 MAX_ATTEMPTS = 3  # a job that keeps killing the worker is failed, not resumed forever
 SOURCE_NAME_RE = re.compile(r"^source\.[a-z0-9]{2,5}$")
+# Whisper repetition loops ("É do Léo mesmo." x150 after laughter). speaches
+# takes a single temperature, so faster-whisper's fallback never runs and a
+# loop carries on to the end of the request. Detected loops are re-transcribed
+# in short pieces (fresh context each); leftover runs are collapsed.
+LOOP_RUN = 3
+LOOP_RATIO = 2.4  # zlib ratio faster-whisper uses for "too repetitive"
+LOOP_MIN_BYTES = 120
+LOOP_PIECE_SECONDS = 30.0
 SHOWINFO_TS_RE = re.compile(r"pts_time:([0-9.]+)")
 DOWNLOAD_FORMAT = "bv*[height<=720]+ba/b[height<=720]/bv+ba/b"
 
@@ -419,14 +429,21 @@ def transcribe(job: Job) -> None:
         eta = (duration - done_audio) / rate if rate else None
         job.update(stage=f"transcrevendo ({i + 1}/{len(chunks)})", chunks_done=i,
                    progress=round(30 + 70 * done_audio / max(duration, 1), 1), eta_seconds=eta)
-        piece = job.work / f"chunk_{i:04d}.mp3"
-        got = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *inbox.input_args("mp3"),
-                   "-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-i", str(job.work / "audio.mp3"),
-                   "-c", "copy", str(piece)], timeout=min(600, job.remaining()))
-        if got.returncode != 0 or not piece.exists():
-            raise JobFailed(f"não foi possível cortar o bloco {i + 1} do áudio")
+        piece = cut_audio(job, start, end, f"chunk_{i:04d}")
         segments = transcribe_chunk(job, piece, model=model, language=language, prompt=prompt)
         piece.unlink(missing_ok=True)
+        if looks_repetitive(segments):
+            log(f"{job.id}: repetition loop in chunk {i + 1}; re-transcribing in {LOOP_PIECE_SECONDS:.0f} s pieces")
+            segments = []
+            t = start
+            while t < end - 0.5:
+                stop = min(end, t + LOOP_PIECE_SECONDS)
+                small = cut_audio(job, t, stop, f"chunk_{i:04d}_piece")
+                part = transcribe_chunk(job, small, model=model, language=language, prompt=prompt)
+                small.unlink(missing_ok=True)
+                segments += [{**seg, "start": seg["start"] + t - start, "end": seg["end"] + t - start} for seg in part]
+                t = stop
+        segments = collapse_repeats(segments)
         shifted = [{"start": round(s["start"] + start, 2), "end": round(s["end"] + start, 2), "text": s["text"]}
                    for s in segments]
         jobstore.write_json_atomic(out, {"start": start, "end": end, "segments": shifted})
@@ -437,6 +454,43 @@ def transcribe(job: Job) -> None:
     jobstore.write_json_atomic(job.dir / "transcript.json", {
         "segments": segments, "model": model, "language": language, "prompt_used": bool(prompt),
     })
+
+
+def cut_audio(job: Job, start: float, end: float, name: str) -> Path:
+    piece = job.work / f"{name}.mp3"
+    got = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *inbox.input_args("mp3"),
+               "-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-i", str(job.work / "audio.mp3"),
+               "-c", "copy", str(piece)], timeout=min(600, job.remaining()))
+    if got.returncode != 0 or not piece.exists():
+        raise JobFailed(f"não foi possível cortar o áudio em {start:.0f}s")
+    return piece
+
+
+def looks_repetitive(segments: list[dict]) -> bool:
+    """LOOP_RUN identical consecutive segments, or one highly compressible segment."""
+    run_length, previous = 1, None
+    for segment in segments:
+        text = textsearch.normalize(segment["text"])
+        run_length = run_length + 1 if text and text == previous else 1
+        if run_length >= LOOP_RUN:
+            return True
+        previous = text
+        raw = segment["text"].encode("utf-8")
+        if len(raw) >= LOOP_MIN_BYTES and len(raw) / len(zlib.compress(raw)) > LOOP_RATIO:
+            return True
+    return False
+
+
+def collapse_repeats(segments: list[dict], keep: int = 2) -> list[dict]:
+    """Drop the 3rd and later of identical consecutive segments (a person may repeat once)."""
+    out, run_length, previous = [], 0, None
+    for segment in segments:
+        text = textsearch.normalize(segment["text"])
+        run_length = run_length + 1 if text and text == previous else 1
+        previous = text
+        if run_length <= keep:
+            out.append(segment)
+    return out
 
 
 def transcribe_chunk(job: Job, piece: Path, *, model: str, language: str | None, prompt: str | None) -> list[dict]:
