@@ -302,3 +302,16 @@ def test_allowed_request_not_logged(origin, capsys):
     with EgressProxy(allow_hosts={"origin.test"}, resolver=RES) as p:
         _get(p, f"http://origin.test:{origin.port}/")
     assert capsys.readouterr().err == ""
+
+
+def test_connect_order_prefers_one_ipv6_then_one_ipv4():
+    results = fake_resolver({"h": ["1.1.1.1", "2.2.2.2", "2001:db8::1", "2001:db8::2"]})("h", 443)
+    order = [r[4][0] for r in netguard._connect_order(results)]
+    assert order == ["2001:db8::1", "1.1.1.1"]
+
+
+def test_proxy_falls_back_to_next_vetted_address(origin):
+    # ::1 refuses (origin listens on 127.0.0.1 only), so the IPv4 address must be tried next.
+    res = fake_resolver({"multi.test": ["::1", "127.0.0.1"]})
+    with EgressProxy(allow_hosts={"multi.test"}, resolver=res) as p:
+        assert _get(p, f"http://multi.test:{origin.port}/") == "hello"

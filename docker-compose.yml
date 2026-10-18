@@ -56,3 +56,6 @@ networks:
   watch-mcp-net:
     name: watch-mcp-net
     driver: bridge
+    # IPv6 egress: YouTube throttles this line's shared (CGNAT) IPv4 with 429 /
+    # "confirm you're not a bot", not its IPv6. netguard's proxy tries IPv6 first.
+    enable_ipv6: true

@@ -155,6 +155,19 @@ def _pipe(a: socket.socket, b: socket.socket, idle: float) -> None:
         sel.close()
 
 
+def _connect_order(results) -> list[tuple]:
+    """First IPv6 address, then first IPv4 address.
+
+    Inside a container with only a ULA IPv6 address, the system ranks IPv4
+    first (RFC 6724), but sites like YouTube throttle a CGNAT line's shared
+    IPv4 and not its IPv6. One address per family bounds the wait when a
+    family has no route.
+    """
+    v6 = [r for r in results if r[0] == socket.AF_INET6][:1]
+    v4 = [r for r in results if r[0] == socket.AF_INET][:1]
+    return v6 + v4
+
+
 def _split_hostport(target: str) -> tuple[str, int]:
     host, sep, port = target.rpartition(":")
     if not sep or not host or not port.isdigit() or not 0 < int(port) < 65536:
@@ -243,17 +256,17 @@ class _Handler(socketserver.BaseRequestHandler):
 
     @staticmethod
     def _connect(results) -> socket.socket:
-        # Connect to the vetted address itself; never resolve again.
-        fam, typ, proto, _, sockaddr = results[0]
-        s = socket.socket(fam, typ, proto)
-        try:
-            s.settimeout(CONNECT_TIMEOUT)
-            s.connect(sockaddr)
-            s.settimeout(None)
-        except OSError:
-            s.close()
-            raise _Upstream("upstream connection failed") from None
-        return s
+        # Connect to a vetted address itself; never resolve again.
+        for fam, typ, proto, _, sockaddr in _connect_order(results):
+            s = socket.socket(fam, typ, proto)
+            try:
+                s.settimeout(CONNECT_TIMEOUT)
+                s.connect(sockaddr)
+                s.settimeout(None)
+                return s
+            except OSError:
+                s.close()
+        raise _Upstream("upstream connection failed")
 
 
 class _Server(socketserver.ThreadingTCPServer):
