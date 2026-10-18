@@ -190,3 +190,13 @@ def test_timeout_expired_becomes_systemexit(monkeypatch, tmp_path):
         with pytest.raises(SystemExit) as exc:
             fn(URL, tmp_path / "x")
         assert "timed out after 5s" in str(exc.value)
+
+
+def test_audio_only_download_falls_back_to_a_single_file_format(monkeypatch, tmp_path):
+    # A direct .mp4 has no separate audio stream; "ba" alone fails with
+    # "Requested format is not available" (found by the v2 counter-review).
+    calls = _capture_argv(monkeypatch)
+    with pytest.raises(SystemExit):
+        download.download_url(URL, tmp_path / "download", audio_only=True)
+    argv = calls[0]
+    assert argv[argv.index("-f") + 1] == "ba/b"

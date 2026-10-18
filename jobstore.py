@@ -10,6 +10,7 @@ replaced atomically so readers never see a half-written file.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import secrets
@@ -140,6 +141,8 @@ def _scan(root: Path | None) -> list[tuple[str, os.DirEntry]]:
 
 
 def _valid_job(name: str, entry: os.DirEntry) -> dict | None:
+    if is_link(Path(entry.path) / "job.json"):
+        return None
     job = read_json(Path(entry.path) / "job.json")
     return job if job is not None and job.get("id") == name else None
 
@@ -156,7 +159,14 @@ def list_jobs(root: Path | None = None) -> list[dict]:
 
 
 def _num(v: Any) -> float:
-    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
+    """A sortable number; anything else (bool, str, huge int, NaN) counts as 0."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return 0.0
+    try:
+        f = float(v)
+    except OverflowError:
+        return 0.0
+    return f if math.isfinite(f) else 0.0
 
 
 def find_cached(cache_key: str, root: Path | None = None) -> dict | None:

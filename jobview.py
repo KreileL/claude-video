@@ -85,16 +85,30 @@ def job_line(job: dict) -> str:
     return f"- `{job['id']}` {state}{progress} · {duration} · {created} · {source_label(job)}{title}"
 
 
+def _usable(segments) -> list[dict]:
+    """Only well-formed segments are served (a damaged cache file must not crash a tool)."""
+    if not isinstance(segments, list):
+        return []
+    out = []
+    for s in segments:
+        if isinstance(s, dict) and isinstance(s.get("text"), str):
+            try:
+                out.append({"start": float(s["start"]), "end": float(s["end"]), "text": s["text"]})
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+    return out
+
+
 def load_segments(job_dir: Path) -> tuple[list[dict], bool]:
     """(segments, partial): the final transcript, or the chunks finished so far."""
     final = jobstore.read_json(job_dir / "transcript.json")
     if final is not None:
-        return final.get("segments") or [], False
+        return _usable(final.get("segments")), False
     segments: list[dict] = []
     chunk_dir = job_dir / "chunks"
     if chunk_dir.is_dir():
         for path in sorted(chunk_dir.glob("[0-9][0-9][0-9][0-9].json")):
-            segments += (jobstore.read_json(path) or {}).get("segments") or []
+            segments += _usable((jobstore.read_json(path) or {}).get("segments"))
     return segments, True
 
 

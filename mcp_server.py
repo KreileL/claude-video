@@ -102,6 +102,7 @@ MAX_TERMS = 30
 TERM_MAX_LEN = 60
 LIST_JOBS_LIMIT = 20
 LIST_INBOX_LIMIT = 200
+QUERY_MAX_LEN = 200
 
 mcp = MCPServer(
     "watch",
@@ -825,6 +826,8 @@ async def search_transcript(job_id: str, query: str) -> str:
 
     Returns the matching passages with timestamps, to open with watch_video(job_id=..., start, end).
     """
+    if not isinstance(query, str) or len(query) > QUERY_MAX_LEN:
+        raise ToolError(f"busca muito longa (máximo {QUERY_MAX_LEN} caracteres)")
     job = load_job(job_id)
     segments, partial = jobview.load_segments(jobstore.job_path(job["id"]))
     if not segments:

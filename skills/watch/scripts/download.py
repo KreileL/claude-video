@@ -209,7 +209,8 @@ def download_url(
     out_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(out_dir / "video.%(ext)s")
 
-    fmt = "ba/bestaudio" if audio_only else "bv*[height<=720]+ba/b[height<=720]/bv+ba/b"
+    # A single-file video (no separate audio stream) still has audio: fall back to it.
+    fmt = "ba/b" if audio_only else "bv*[height<=720]+ba/b[height<=720]/bv+ba/b"
     cmd = [
         "yt-dlp",
         *_extra_args(),

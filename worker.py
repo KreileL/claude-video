@@ -33,7 +33,10 @@ import tempfile
 import threading
 import time
 import urllib.request
+import hashlib
 import zlib
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from pathlib import Path
 
 import chunking
@@ -70,6 +73,9 @@ MAX_INDEX_FRAMES = 2500
 INDEX_FRAME_BYTES = 60_000  # generous per-JPEG estimate for the disk check
 AUDIO_BYTES_PER_SECOND = 8_000  # 64 kb/s mp3
 TITLE_LIMIT = 300
+DISK_POLL = 1.0
+NO_ROOM = ("sem espaço no cache de trabalhos (teto WATCH_JOBS_MAX_BYTES); "
+           "apague trabalhos antigos ou aumente o teto")
 SCENE_THRESHOLD = 0.3
 WHISPER_RETRIES = (30, 60, 120)  # seconds to wait before each retry of a chunk
 MAX_ATTEMPTS = 3  # a job that keeps killing the worker is failed, not resumed forever
@@ -98,23 +104,37 @@ def log(message: str) -> None:
 
 
 def run(argv: list[str], *, timeout: float, pass_fds: tuple[int, ...] = (), env: dict | None = None,
-        cwd: Path | None = None) -> subprocess.CompletedProcess:
+        cwd: Path | None = None, disk: tuple[Path, int] | None = None) -> subprocess.CompletedProcess:
     """Run argv (never a shell) in its own process group; on timeout the whole
-    group dies (yt-dlp spawns ffmpeg)."""
+    group dies (yt-dlp spawns ffmpeg). `disk=(dir, room)`: the step is killed as
+    soon as what it wrote under dir exceeds room bytes (real bytes, checked
+    every DISK_POLL s — not an estimate)."""
     proc = subprocess.Popen(
         argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace", pass_fds=pass_fds, env=env,
         cwd=str(cwd) if cwd else None, start_new_session=os.name == "posix",
     )
+    end = time.monotonic() + max(1.0, timeout)
+    limit = jobstore.dir_size(disk[0]) + disk[1] if disk else None
     try:
-        stdout, stderr = proc.communicate(timeout=max(1.0, timeout))
-    except subprocess.TimeoutExpired:
-        _kill(proc)
-        proc.communicate()
-        raise JobFailed(f"tempo limite excedido em {Path(argv[0]).name}") from None
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=max(0.05, min(DISK_POLL, end - time.monotonic())))
+                break
+            except subprocess.TimeoutExpired:
+                if disk and jobstore.dir_size(disk[0]) > limit:
+                    _kill(proc)
+                    proc.communicate()
+                    raise JobFailed(NO_ROOM) from None
+                if time.monotonic() >= end:
+                    _kill(proc)
+                    proc.communicate()
+                    raise JobFailed(f"tempo limite excedido em {Path(argv[0]).name}") from None
     except BaseException:
         _kill(proc)
         raise
+    if disk and jobstore.dir_size(disk[0]) > limit:
+        raise JobFailed(NO_ROOM)
     _kill(proc)  # strays left by the child must not outlive the step
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
@@ -133,7 +153,12 @@ def _kill(proc: subprocess.Popen) -> None:
 
 
 def _finite(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an int too large for a float
+        return False
 
 
 def validate(data: dict) -> None:
@@ -150,7 +175,7 @@ def validate(data: dict) -> None:
     terms = data.get("terms") or []
     if not (isinstance(terms, list) and all(isinstance(t, str) for t in terms)):
         problems.append("terms")
-    for key in ("started",):
+    for key in ("started", "created", "updated"):
         if data.get(key) is not None and not _finite(data[key]):
             problems.append(key)
     attempts = data.get("attempts")
@@ -192,7 +217,7 @@ def cache_used(root: Path | None) -> int:
 
 
 def ensure_room(job: Job, need: int) -> int:
-    """Room left under WATCH_JOBS_MAX_BYTES once `need` more bytes are written.
+    """Free room under WATCH_JOBS_MAX_BYTES, checked to fit `need` more bytes.
 
     Finished jobs are evicted first (oldest first); queued/running never are.
     """
@@ -205,7 +230,7 @@ def ensure_room(job: Job, need: int) -> int:
             f"sem espaço no cache de trabalhos (teto de {MAX_JOBS_BYTES / 1024**3:.1f} GB, "
             f"em uso {used / 1024**3:.2f} GB); apague trabalhos antigos ou aumente WATCH_JOBS_MAX_BYTES"
         )
-    return MAX_JOBS_BYTES - used - need
+    return MAX_JOBS_BYTES - used
 
 
 def pick_model(quality: str, duration: float) -> str:
@@ -278,8 +303,19 @@ class Source:
             pass
 
     def identity(self) -> dict:
-        st = os.fstat(self.fd)
-        return {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "duration": round(self.info["duration"], 3)}
+        """Content identity of the open file (SHA-256 through the fd)."""
+        digest, offset = hashlib.sha256(), 0
+        while True:
+            if hasattr(os, "pread"):
+                block = os.pread(self.fd, 1 << 20, offset)
+            else:  # Windows (development)
+                os.lseek(self.fd, offset, os.SEEK_SET)
+                block = os.read(self.fd, 1 << 20)
+            if not block:
+                break
+            digest.update(block)
+            offset += len(block)
+        return {"size": offset, "sha256": digest.hexdigest(), "duration": round(self.info["duration"], 3)}
 
 
 def open_checked(name: str, root: Path, timeout: float = 120.0) -> Source:
@@ -337,7 +373,7 @@ def download(job: Job, url: str) -> Path:
                        duration=info.get("duration") if _finite(info.get("duration")) else None)
             got = run(["yt-dlp", *extra, "-N", "4", "-f", DOWNLOAD_FORMAT, "--merge-output-format", "mkv",
                        "--no-playlist", "-o", str(work / "source.%(ext)s"), "--", url],
-                      timeout=job.remaining(), env=env, cwd=tmp)
+                      timeout=job.remaining(), env=env, cwd=tmp, disk=(work, room))
             if proxy.exceeded:
                 if budget < MAX_DOWNLOAD_BYTES:
                     raise JobFailed(f"sem espaço no cache de trabalhos para o download "
@@ -390,13 +426,13 @@ def write_meta(job: Job, info: dict, secrets: frozenset[str] = frozenset()) -> d
     for key in ("title", "uploader", "channel", "uploader_id", "webpage_url", "upload_date"):
         value = info.get(key)
         if isinstance(value, str) and value.strip():
-            meta[key] = mcp_server.scrub(value.strip()[:TITLE_LIMIT], secrets)
+            meta[key] = mcp_server.scrub(value.strip(), secrets)[:TITLE_LIMIT]
     for key in ("duration", "width", "height"):
         if _finite(info.get(key)):
             meta[key] = info[key]
     description = info.get("description")
     if isinstance(description, str) and description.strip():
-        meta["description"] = mcp_server.scrub(description.strip()[:mcp_server.DESCRIPTION_LIMIT], secrets)
+        meta["description"] = mcp_server.scrub(description.strip(), secrets)[:mcp_server.DESCRIPTION_LIMIT]
     jobstore.write_json_atomic(job.dir / "meta.json", meta)
     return meta
 
@@ -421,11 +457,14 @@ def open_source(job: Job, inbox_root: Path) -> Source:
 def check_identity(job: Job, src: Source) -> None:
     """Artifacts of one job come from one file: the one the server saw (inbox
     fingerprint) and the one opened first (resume after a restart)."""
-    now = src.identity()
     changed = JobFailed("o arquivo de origem mudou durante o processamento; rode analyze_video de novo")
     seen = job.data.get("fingerprint")
-    if job.data["source"]["kind"] == "inbox" and seen and list(seen) != [now["size"], now["mtime_ns"]]:
-        raise changed
+    if job.data["source"]["kind"] == "inbox" and seen:
+        st = os.fstat(src.fd)
+        if list(seen) != [st.st_size, st.st_mtime_ns]:
+            raise changed
+    job.update(stage="verificando o arquivo")
+    now = src.identity()
     first = job.data.get("source_identity")
     if first is None:
         job.update(source_identity=now)
@@ -447,11 +486,11 @@ def extract_audio(job: Job, src: Source) -> None:
         return
     job.update(stage="extraindo áudio", progress=15.0)
     need = int((duration + 10) * AUDIO_BYTES_PER_SECOND * 1.2) + 65_536
-    ensure_room(job, need)
+    room = ensure_room(job, need)
     tmp = job.work / "audio.tmp.mp3"
     got = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *src.input(), "-t", src.limit(),
                "-vn", "-acodec", "libmp3lame", "-ar", "16000", "-ac", "1", "-b:a", "64k", "-fs", str(need),
-               str(tmp)], timeout=job.remaining(), pass_fds=src.fds)
+               str(tmp)], timeout=job.remaining(), pass_fds=src.fds, disk=(job.work, room))
     if got.returncode != 0 or not tmp.exists():
         raise JobFailed("não foi possível extrair o áudio")
     tmp.replace(audio)
@@ -474,7 +513,7 @@ def build_index(job: Job, src: Source) -> None:
         return
     duration = src.info["duration"]
     bound = index_bound(duration)
-    ensure_room(job, bound * INDEX_FRAME_BYTES)
+    room = ensure_room(job, bound * INDEX_FRAME_BYTES)
     frames.mkdir()
     job.update(stage="indexando cenas", progress=20.0)
     grid = grid_interval(duration)
@@ -486,7 +525,7 @@ def build_index(job: Job, src: Source) -> None:
     got = run(["ffmpeg", "-hide_banner", "-loglevel", "info", "-y", *src.input(), "-t", src.limit(),
                "-an", "-sn", "-vf", f"{scale_filter()},{select},showinfo", "-fps_mode", "vfr",
                "-frames:v", str(bound), "-q:v", "5", str(frames / "f_%05d.jpg")],
-              timeout=job.remaining(), pass_fds=src.fds)
+              timeout=job.remaining(), pass_fds=src.fds, disk=(frames, room))
     if got.returncode != 0:
         raise JobFailed("não foi possível extrair os frames do vídeo")
     times = [float(t) for t in SHOWINFO_TS_RE.findall(got.stderr)]
@@ -505,19 +544,20 @@ def build_index(job: Job, src: Source) -> None:
 
 
 def whisper_ready(timeout: float = 600.0) -> None:
-    """Wait for watch-whisper (it may be restarting) before giving up on the job."""
+    """Wait for watch-whisper (it may be restarting), never past `timeout`."""
     url = mcp_server.whisper_health_url()
     end = time.monotonic() + timeout
     while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            raise JobFailed(f"o Whisper local (watch-whisper) não respondeu a tempo: {mcp_server.STACK_HINT}")
         try:
-            with urllib.request.urlopen(url, timeout=5) as response:
+            with urllib.request.urlopen(url, timeout=min(5.0, left)) as response:
                 if response.status == 200:
                     return
         except Exception:
             pass
-        if time.monotonic() > end:
-            raise JobFailed(f"o Whisper local (watch-whisper) não respondeu: {mcp_server.STACK_HINT}")
-        time.sleep(10)
+        time.sleep(max(0.0, min(10.0, end - time.monotonic())))
 
 
 def transcribe(job: Job) -> None:
@@ -534,7 +574,7 @@ def transcribe(job: Job) -> None:
     fresh_audio = 0.0
     for i, (start, end) in enumerate(chunks):
         out = chunk_dir / f"{i:04d}.json"
-        if isinstance((jobstore.read_json(out) or {}).get("segments"), list):
+        if valid_segments((jobstore.read_json(out) or {}).get("segments")):
             continue  # finished before a restart (a corrupt file is redone)
         done_audio = sum(e - s for s, e in chunks[:i])
         rate = fresh_audio / (time.monotonic() - started) if fresh_audio else None
@@ -605,14 +645,40 @@ def collapse_repeats(segments: list[dict], keep: int = 2) -> list[dict]:
     return out
 
 
+def within(seconds: float, call):
+    """Run call() but stop waiting after `seconds`: a socket timeout is per
+    operation, so a slow upload or a trickling reply could otherwise hold the
+    single worker long past the job deadline. The abandoned request ends on its
+    own socket timeout."""
+    pool = ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(call)
+    try:
+        return future.result(timeout=max(0.0, seconds))
+    except FutureTimeout:
+        raise JobFailed(f"tempo total do trabalho excedido ({JOB_TIMEOUT / 3600:.1f} h): "
+                        "o Whisper não respondeu a tempo") from None
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def valid_segments(segments) -> bool:
+    return isinstance(segments, list) and all(
+        isinstance(s, dict) and _finite(s.get("start")) and _finite(s.get("end")) and isinstance(s.get("text"), str)
+        for s in segments
+    )
+
+
 def transcribe_chunk(job: Job, piece: Path, *, model: str, language: str | None, prompt: str | None) -> list[dict]:
     """One chunk, entirely inside the job deadline (health wait, request, retries)."""
     for wait in (*WHISPER_RETRIES, None):
         whisper_ready(timeout=min(600.0, job.remaining()))
         try:
-            segments = transcribe_local(piece, model=model, language=language, prompt=prompt,
-                                        deadline=time.monotonic() + job.remaining())
+            left = job.remaining()
+            segments = within(left, lambda: transcribe_local(
+                piece, model=model, language=language, prompt=prompt, deadline=time.monotonic() + left))
             job.remaining()  # a reply that lands after the deadline does not count
+            if not valid_segments(segments):
+                raise SystemExit("resposta do Whisper em formato inesperado")
             return segments
         except SystemExit as exc:
             if wait is None or job.remaining() < wait:
@@ -665,7 +731,10 @@ def process(data: dict, *, root: Path | None = None, inbox_root: Path | None = N
 
 
 def fail(job: Job, message: str) -> None:
-    shutil.rmtree(job.work, ignore_errors=True)
+    # A failed job is never resumed: keep only job.json/meta.json, free the rest
+    # (including what a step wrote before it was stopped for lack of room).
+    for heavy in (job.work, job.dir / "frames", job.dir / "chunks"):
+        shutil.rmtree(heavy, ignore_errors=True)
     job.update(state="failed", stage="falhou", error=mcp_server.scrub(message), eta_seconds=None,
                finished=time.time())
 
@@ -685,12 +754,17 @@ def main() -> None:
     log(f"started: jobs={jobstore.JOBS_DIR} inbox={inbox.INBOX_DIR} fast={MODEL_FAST} accurate={MODEL_ACCURATE}")
     last_cleanup = 0.0
     while True:
-        if time.monotonic() - last_cleanup > CLEANUP_EVERY:
-            removed = jobstore.cleanup(ttl_seconds=TTL_SECONDS, max_bytes=MAX_JOBS_BYTES)
-            if removed:
-                log(f"cleanup removed {len(removed)} job(s)")
-            last_cleanup = time.monotonic()
-        job = jobstore.next_job()
+        try:
+            if time.monotonic() - last_cleanup > CLEANUP_EVERY:
+                last_cleanup = time.monotonic()
+                removed = jobstore.cleanup(ttl_seconds=TTL_SECONDS, max_bytes=MAX_JOBS_BYTES)
+                if removed:
+                    log(f"cleanup removed {len(removed)} job(s)")
+            job = jobstore.next_job()
+        except Exception as exc:  # noqa: BLE001 - a corrupt queue entry must not stop the worker
+            log(f"queue scan failed ({type(exc).__name__}); retrying")
+            time.sleep(POLL_SECONDS)
+            continue
         if job is None:
             time.sleep(POLL_SECONDS)
             continue

@@ -331,10 +331,10 @@ O vídeo e o áudio são apagados assim que deixam de ser necessários. Trabalho
 | Variável | Padrão | O quê |
 |---|---|---|
 | `WATCH_JOB_MAX_DURATION` | 14400 (4 h) | duração máxima da mídia |
-| `WATCH_JOB_MAX_DOWNLOAD_BYTES` | 4 GiB | teto rígido de download por trabalho (contado pelo proxy) |
+| `WATCH_JOB_MAX_DOWNLOAD_BYTES` | 4 GiB | teto rígido de download **por tentativa** (contado pelo proxy). Um trabalho interrompido é retomado no máximo 3 vezes; o disco continua limitado por `WATCH_JOBS_MAX_BYTES` |
 | `WATCH_JOB_TIMEOUT` | 28800 (8 h) | tempo total por trabalho |
 | `WATCH_JOB_TTL` | 604800 (7 dias) | retenção depois da última atualização |
-| `WATCH_JOBS_MAX_BYTES` | 20 GiB | teto do cache inteiro |
+| `WATCH_JOBS_MAX_BYTES` | 20 GiB | teto do cache inteiro: conferido antes de cada etapa e vigiado durante o download, a extração de áudio e o índice (a etapa é interrompida e o trabalho falha com "sem espaço") |
 | `WATCH_MODEL_FAST` / `WATCH_MODEL_ACCURATE` | ver benchmark | modelos do `quality="auto"` |
 
 ### Benchmark pt-BR
