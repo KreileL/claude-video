@@ -18,6 +18,10 @@ JOBS_DIR (see jobstore.py); this process owns every later write. Per job:
 Every stage is skipped when its output exists, which is what makes a job
 resumable after the worker restarts. Nothing secret is written under JOBS_DIR:
 cookies are copied to a private dir on the container's tmpfs.
+
+v3: a done job then goes through postproc.py (LLM summary, a folder in the
+Holocron's "00 - Entrada", archived state). `python /app/worker.py export
+<job_id> [--again]` does the same for a job finished earlier.
 """
 from __future__ import annotations
 
@@ -38,10 +42,12 @@ import zlib
 from pathlib import Path
 
 import chunking
+import entrada
 import inbox
 import jobstore
 import mcp_server
 import netguard
+import postproc
 import textsearch
 from whisper import transcribe_local
 
@@ -53,6 +59,9 @@ MAX_JOBS_BYTES = int(os.environ.get("WATCH_JOBS_MAX_BYTES", str(20 * 1024**3)))
 CHUNK_SECONDS = float(os.environ.get("WATCH_CHUNK_SECONDS", "300"))
 POLL_SECONDS = float(os.environ.get("WATCH_WORKER_POLL", "2"))
 CLEANUP_EVERY = 600.0
+RETRY_EVERY = 60.0  # v3: pending notes/summaries
+BOOT_ID = os.urandom(8).hex()  # tells this process's heartbeat from another worker's
+OTHER_WORKER_STALE = 45.0
 # Chosen by the pt-BR benchmark (NOTES-mcp.md, "v2"); overridable per deployment.
 MODEL_FAST = os.environ.get("WATCH_MODEL_FAST", "Systran/faster-whisper-small")
 MODEL_ACCURATE = os.environ.get("WATCH_MODEL_ACCURATE", "deepdml/faster-whisper-large-v3-turbo-ct2")
@@ -217,7 +226,9 @@ class Job:
 
 
 def cache_used(root: Path | None) -> int:
-    return sum(jobstore.dir_size(jobstore.job_path(j["id"], root)) for j in jobstore.list_jobs(root))
+    """Bytes of the working cache; archived jobs (v3) are kept apart from the cap."""
+    return sum(jobstore.dir_size(jobstore.job_path(j["id"], root)) for j in jobstore.list_jobs(root)
+               if j.get("state") != jobstore.ARCHIVED)
 
 
 def ensure_room(job: Job, need: int) -> int:
@@ -750,7 +761,9 @@ def process(data: dict, *, root: Path | None = None, inbox_root: Path | None = N
             leftover.unlink(missing_ok=True)  # the whole video is not kept
         transcribe(job)
         shutil.rmtree(job.work, ignore_errors=True)
-        job.update(state="done", stage="concluído", progress=100.0, eta_seconds=None, finished=time.time())
+        # export="pendente" first: a crash before postproc.finish still gets the note later.
+        job.update(state="done", stage="concluído", progress=100.0, eta_seconds=None, finished=time.time(),
+                   export="pendente")
     except (JobFailed, inbox.InboxError, netguard.BlockedURL) as exc:
         fail(job, str(exc))
     except Exception as exc:  # noqa: BLE001 - recorded on the job, worker keeps running
@@ -774,17 +787,65 @@ def heartbeat(every: float = 15.0) -> None:
     """Lets the stdio server tell "queued" from "nobody is processing"."""
     while True:
         try:
-            jobstore.write_json_atomic(jobstore.JOBS_DIR / jobstore.HEARTBEAT_FILE, {"t": time.time()})
+            jobstore.write_json_atomic(jobstore.JOBS_DIR / jobstore.HEARTBEAT_FILE,
+                                       {"t": time.time(), "worker": "v3", "boot": BOOT_ID})
         except OSError as exc:
             log(f"heartbeat failed: {type(exc).__name__}")
         time.sleep(every)
 
 
+def wait_for_other_worker(root: Path | None = None, sleep=time.sleep) -> None:
+    """Two workers on one queue would process the same job twice: while another
+    worker's heartbeat is fresh (e.g. the v2 container still running), wait."""
+    warned = False
+    while True:
+        beat = jobstore.read_json((root or jobstore.JOBS_DIR) / jobstore.HEARTBEAT_FILE) or {}
+        t = jobstore.as_number(beat.get("t"))
+        if beat.get("boot") == BOOT_ID or time.time() - t > OTHER_WORKER_STALE:
+            return
+        if not warned:
+            log("another worker's heartbeat is fresh; waiting until it stops")
+            warned = True
+        sleep(5)
+
+
+def export_cli(argv: list[str]) -> int:
+    """python /app/worker.py export <job_id> [--again]"""
+    args = [a for a in argv if a != "--again"]
+    if len(args) != 1:
+        print("uso: worker.py export <job_id> [--again]", file=sys.stderr)
+        return 2
+    try:
+        folder = postproc.run_export(args[0], again="--again" in argv)
+    except (jobstore.JobError, entrada.EntradaError, postproc.Busy) as exc:
+        print(f"recusado: {exc}", file=sys.stderr)
+        return 1
+    if folder is None:
+        job = jobstore.load_job(args[0])
+        print(f"nota pendente: {job.get('export_error')}", file=sys.stderr)
+        return 3
+    job = jobstore.load_job(args[0])
+    print(f"ok: {postproc.jobview.ENTRADA_LABEL}/{folder} (resumo: {job.get('resumo')})")
+    return 0
+
+
 def main() -> None:
+    if sys.argv[1:2] == ["export"]:
+        sys.exit(export_cli(sys.argv[2:]))
+    wait_for_other_worker()
     threading.Thread(target=heartbeat, daemon=True).start()
     log(f"started: jobs={jobstore.JOBS_DIR} inbox={inbox.INBOX_DIR} fast={MODEL_FAST} accurate={MODEL_ACCURATE}")
-    last_cleanup = 0.0
+    log(f"v3: entrada={entrada.ENTRADA_DIR} ({'ok' if entrada.available() else 'indisponível'}) "
+        f"resumo={postproc.resumo.PROVIDER}:{postproc.resumo.GEMINI_MODEL} "
+        f"caixa_de_entrada={'sim' if postproc.RESUMO_CAIXA_ENTRADA else 'não'}")
+    removed = entrada.clean_orphans()
+    if removed:
+        log(f"removed {len(removed)} orphan staging dir(s) in {entrada.TMP_NAME}")
+    last_cleanup = last_retry = 0.0
     while True:
+        if time.monotonic() - last_retry > RETRY_EVERY:
+            last_retry = time.monotonic()
+            postproc.retry_due()
         try:
             if time.monotonic() - last_cleanup > CLEANUP_EVERY:
                 last_cleanup = time.monotonic()
@@ -802,7 +863,10 @@ def main() -> None:
         log(f"{job['id']}: {job.get('state')} → processing")
         try:
             process(job)
-            log(f"{job['id']}: {jobstore.load_job(job['id']).get('state')}")
+            state = jobstore.load_job(job["id"]).get("state")
+            log(f"{job['id']}: {state}")
+            if state == "done":
+                postproc.finish(job["id"])
         except Exception as exc:  # noqa: BLE001 - one bad job must not stop the queue
             log(f"{job['id']}: worker error {type(exc).__name__}; marking it failed")
             try:

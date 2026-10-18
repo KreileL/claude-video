@@ -1,0 +1,350 @@
+"""v3 post-processing of a finished job: summary → Holocron folder → archived.
+
+Called by worker.py right after a job is done, periodically for pending work,
+and by `python /app/worker.py export <job_id>`. Nothing here may fail the job:
+the transcript and frames are already safe in JOBS_DIR. Job fields written:
+
+- resumo: ok | pendente | desligado | erro (+ resumo_next, resumo_attempts,
+  resumo_error, resumo_calls, resumo_model, resumo_file); the text itself is
+  kept in the job dir as summary.json, so an export retry never calls the LLM again.
+- export: ok | pendente (+ export_next, export_attempts, export_error),
+  entrada_folder, entrada_index, exported_at; on success state → archived.
+
+Jobs finished before v3 (no "export" field) are only exported on request.
+"""
+from __future__ import annotations
+
+import os
+import re
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import entrada
+import jobstore
+import jobview
+import resumo
+
+RESUMO_CAIXA_ENTRADA = os.environ.get("WATCH_RESUMO_CAIXA_ENTRADA", "1").strip().lower() not in ("0", "false", "nao", "não", "off")
+UTC_OFFSET = timezone(timedelta(hours=float(os.environ.get("WATCH_UTC_OFFSET_HOURS", "-3"))))
+SUMMARY_TIMEOUT = float(os.environ.get("WATCH_RESUMO_JOB_TIMEOUT", "900"))
+RETRY_FIRST, RETRY_MAX = 300.0, 6 * 3600.0  # transient summary failures: 5 min, doubling, up to 6 h
+PERMANENT_TRIES = 3  # a non-transient summary error is retried this many times, then "erro"
+EXPORT_RETRY, EXPORT_RETRY_MAX = 300.0, 3600.0
+LOCK_NAME = ".export.lock"
+LOCK_STALE = 3600.0
+SUMMARY_FILE = "summary.json"
+SUMMARY_FRAMES = 6
+HIGHLIGHTS = 8
+READY = ("done", jobstore.ARCHIVED)
+
+
+def log(message: str) -> None:
+    print(f"[postproc] {message}", flush=True)
+
+
+class Busy(Exception):
+    """Another process is exporting this job right now."""
+
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+
+def _lock(job_dir: Path) -> Path:
+    path = job_dir / LOCK_NAME
+    try:
+        if time.time() - os.lstat(path).st_mtime > LOCK_STALE:
+            path.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        entrada.create_file(path, str(os.getpid()))
+    except FileExistsError:
+        raise Busy("exportação já em andamento para este trabalho") from None
+    return path
+
+
+def _backoff(attempts: int, first: float, cap: float) -> float:
+    return min(cap, first * (2 ** max(0, attempts - 1)))
+
+
+def title_of(job: dict, meta: dict) -> str:
+    source = job.get("source") or {}
+    title = str(meta.get("title") or source.get("value") or "Vídeo")
+    if source.get("kind") == "inbox":
+        stem = title.rsplit(".", 1)[0] if "." in title else title
+        title = stem.replace("_", " ")
+    return title
+
+
+def origem_of(job: dict) -> str:
+    source = job.get("source") or {}
+    if source.get("kind") == "inbox":
+        return f"caixa de entrada: {source.get('value', '?')}"
+    return str(source.get("value", "?"))
+
+
+def summary_wanted(job: dict) -> bool:
+    if resumo.PROVIDER == "none":
+        return False
+    return (job.get("source") or {}).get("kind") != "inbox" or RESUMO_CAIXA_ENTRADA
+
+
+def highlights(segments: list[dict], n: int = HIGHLIGHTS) -> list[dict]:
+    """Evenly spread transcript lines, for a note without a summary."""
+    if not segments:
+        return []
+    step = max(1, len(segments) // n)
+    return [{"t": s["start"], "text": s["text"]} for s in segments[::step][:n]]
+
+
+def demote(summary: str) -> str:
+    """The summary sits under the note's "## Resumo": its ## sections become ###."""
+    return re.sub(r"^(#{1,5}) ", lambda m: "#" + m.group(1) + " ", summary, flags=re.M)
+
+
+def _frame_bytes(job_dir: Path, name: str) -> bytes | None:
+    if not entrada.SRC_FRAME_RE.fullmatch(name):
+        return None
+    frames = job_dir / "frames"
+    if jobstore.is_link(frames) or jobstore.is_link(frames / name):
+        return None
+    try:
+        fd = os.open(frames / name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as f:
+        return f.read(2_000_000)
+
+
+def _date(job: dict) -> str:
+    stamp = jobstore.as_number(job.get("finished")) or time.time()
+    return datetime.fromtimestamp(stamp, UTC_OFFSET).strftime("%Y-%m-%d")
+
+
+def _material(job: dict, root: Path | None) -> dict:
+    job_dir = jobstore.job_path(job["id"], root)
+    if jobstore.is_link(job_dir):
+        raise entrada.EntradaError("trabalho inválido")
+    meta = jobstore.read_json(job_dir / "meta.json") or {}
+    index = jobstore.read_json(job_dir / "index.json") or {}
+    segments, _partial = jobview.load_segments(job_dir)
+    key = entrada.pick_key_frames(index.get("frames") or [])
+    return {"dir": job_dir, "meta": meta, "segments": segments, "key_frames": key,
+            "title": title_of(job, meta)}
+
+
+# ── summary ────────────────────────────────────────────────────────────────
+
+
+def stored_summary(job_dir: Path) -> str | None:
+    data = jobstore.read_json(job_dir / SUMMARY_FILE) or {}
+    text = data.get("text")
+    return text if isinstance(text, str) and text.strip() else None
+
+
+def try_summary(job: dict, mat: dict, root: Path | None) -> str | None:
+    """One summary attempt; updates the job's resumo fields. Returns the text or None."""
+    if not summary_wanted(job):
+        jobstore.update_job(job["id"], root, resumo="desligado")
+        return None
+    frames = []
+    for f in mat["key_frames"][:: max(1, len(mat["key_frames"]) // SUMMARY_FRAMES)][:SUMMARY_FRAMES]:
+        data = _frame_bytes(mat["dir"], f["file"])
+        if data:
+            frames.append((f["t"], data))
+    attempts = int(jobstore.as_number(job.get("resumo_attempts"))) + 1
+    duration = jobstore.as_number(job.get("duration")) or None
+    try:
+        result = resumo.summarize(mat["segments"], title=mat["title"], duration=duration, frames=frames,
+                                  deadline=time.monotonic() + SUMMARY_TIMEOUT)
+    except resumo.ResumoDisabled:
+        jobstore.update_job(job["id"], root, resumo="desligado")
+        return None
+    except resumo.ResumoError as exc:
+        calls = int(jobstore.as_number(job.get("resumo_calls")))
+        if not exc.transient and attempts >= PERMANENT_TRIES:
+            jobstore.update_job(job["id"], root, resumo="erro", resumo_error=str(exc)[:300],
+                                resumo_attempts=attempts, resumo_next=None, resumo_calls=calls + 1)
+        else:
+            wait = _backoff(attempts, RETRY_FIRST, RETRY_MAX)
+            jobstore.update_job(job["id"], root, resumo="pendente", resumo_error=str(exc)[:300],
+                                resumo_attempts=attempts, resumo_next=time.time() + wait, resumo_calls=calls + 1)
+        log(f"{job['id']}: resumo falhou ({exc}); tentativa {attempts}")
+        return None
+    jobstore.write_json_atomic(mat["dir"] / SUMMARY_FILE, {
+        "text": result.text, "provider": result.provider, "model": result.model, "at": time.time()})
+    jobstore.update_job(job["id"], root, resumo="ok", resumo_error=None, resumo_next=None,
+                        resumo_attempts=attempts, resumo_model=f"{result.provider}:{result.model}",
+                        resumo_calls=int(jobstore.as_number(job.get("resumo_calls"))) + result.calls)
+    log(f"{job['id']}: resumo ok ({result.calls} chamada(s) ao {result.provider})")
+    return result.text
+
+
+# ── export ─────────────────────────────────────────────────────────────────
+
+
+def _status_for_note(job: dict) -> str:
+    state = job.get("resumo")
+    return state if state in ("ok", "desligado") else "pendente"
+
+
+def build_folder(job: dict, mat: dict, summary: str | None, entrada_root: Path | None) -> tuple[str, str]:
+    """Stage and publish one complete folder; returns (folder, index file name)."""
+    staged = entrada.staging(entrada_root, job["id"])
+    frames_dir = staged / "frames"
+    frames_dir.mkdir()
+    used: set[str] = set()
+    note_frames = []
+    for f in mat["key_frames"]:
+        data = _frame_bytes(mat["dir"], f["file"])
+        if not data:
+            continue
+        name = entrada.frame_filename(f["t"])
+        n = 2
+        while name in used:
+            name = entrada.frame_filename(f["t"])[:-4] + f"-{n}.jpg"
+            n += 1
+        used.add(name)
+        entrada.create_file(frames_dir / name, data)
+        note_frames.append({"t": f["t"], "file": name})
+    meta = mat["meta"]
+    title = mat["title"]
+    status = "ok" if summary else _status_for_note(job)
+    info = {
+        "title": title, "job_id": job["id"], "date": _date(job), "origem": origem_of(job),
+        "duration": jobstore.as_number(job.get("duration")) or None,
+        "autor": meta.get("uploader") or meta.get("channel"), "modelo": job.get("model"),
+        "idioma": job.get("language") or "automático", "resumo_status": status,
+        "summary": demote(summary) if summary else None,
+        "highlights": [] if summary else highlights(mat["segments"]), "frames": note_frames,
+        "origin_kind": (job.get("source") or {}).get("kind"),
+    }
+    index_file = entrada.index_filename(title)
+    if index_file == "Transcrição.md":
+        index_file = "Nota - Transcrição.md"
+    entrada.create_file(staged / "Transcrição.md", entrada.render_transcript(title, mat["segments"]))
+    entrada.create_file(staged / index_file, entrada.render_index(info))
+    folder = entrada.publish(entrada_root, staged, entrada.folder_name(info["date"], title, job["id"]))
+    return folder, index_file
+
+
+def _mark_exported(job: dict, root: Path | None, folder: str, index_file: str) -> None:
+    fields = {"export": "ok", "export_error": None, "export_next": None, "entrada_folder": folder,
+              "entrada_index": index_file, "exported_at": time.time()}
+    if job.get("state") != jobstore.ARCHIVED:
+        fields.update(state=jobstore.ARCHIVED, archived=True, archived_at=time.time(),
+                      archived_from=job.get("state"))
+    jobstore.update_job(job["id"], root, **fields)
+
+
+def _export_pending(job: dict, root: Path | None, reason: str) -> None:
+    attempts = int(jobstore.as_number(job.get("export_attempts"))) + 1
+    jobstore.update_job(job["id"], root, export="pendente", export_error=reason[:300], export_attempts=attempts,
+                        export_next=time.time() + _backoff(attempts, EXPORT_RETRY, EXPORT_RETRY_MAX))
+    log(f"{job['id']}: nota pendente ({reason})")
+
+
+def run_export(job_id: str, root: Path | None = None, entrada_root: Path | None = None, *,
+               again: bool = False, summarize: bool = True) -> str | None:
+    """Summary (if due) + folder. Returns the folder name, or None when left pending.
+    Raises Busy, jobstore.JobError, or entrada.EntradaError for a refused request."""
+    job = jobstore.load_job(job_id, root)
+    if job.get("state") not in READY:
+        raise entrada.EntradaError("o trabalho ainda não terminou (ou falhou)")
+    if job.get("entrada_folder") and job.get("export") == "ok" and not again:
+        raise entrada.EntradaError(f"já exportado em {jobview.ENTRADA_LABEL}/{job['entrada_folder']} "
+                                   "(use --again para uma nova versão)")
+    job_dir = jobstore.job_path(job_id, root)
+    lock = _lock(job_dir)
+    try:
+        mat = _material(job, root)
+        summary = stored_summary(job_dir)
+        due = job.get("resumo") != "pendente" or jobstore.as_number(job.get("resumo_next")) <= time.time()
+        if summary is None and summarize and due and job.get("resumo") not in ("desligado", "erro"):
+            summary = try_summary(job, mat, root)
+            job = jobstore.load_job(job_id, root)
+        if not entrada.available(entrada_root):
+            _export_pending(job, root, "pasta de entrada do Holocron indisponível ou sem escrita")
+            return None
+        try:
+            folder, index_file = build_folder(job, mat, summary, entrada_root)
+        except (entrada.EntradaError, OSError) as exc:
+            _export_pending(job, root, f"falha ao gravar a nota ({type(exc).__name__})")
+            return None
+        _mark_exported(job, root, folder, index_file)
+        log(f"{job_id}: nota em {jobview.ENTRADA_LABEL}/{folder}")
+        return folder
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def add_late_summary(job_id: str, root: Path | None = None, entrada_root: Path | None = None) -> None:
+    """A pending summary finally worked: Resumo.md in the published folder, or a
+    new complete folder when the user already moved/renamed it (create-only)."""
+    job = jobstore.load_job(job_id, root)
+    job_dir = jobstore.job_path(job_id, root)
+    lock = _lock(job_dir)
+    try:
+        mat = _material(job, root)
+        summary = stored_summary(job_dir) or try_summary(job, mat, root)
+        if summary is None:
+            return
+        job = jobstore.load_job(job_id, root)
+        if not entrada.available(entrada_root):
+            jobstore.update_job(job_id, root, resumo_file_pending=True)
+            return
+        info = {"title": mat["title"], "job_id": job_id, "date": _date(job),
+                "index_file": job.get("entrada_index") or entrada.index_filename(mat["title"])}
+        name = entrada.add_file(entrada_root, job.get("entrada_folder") or "", "Resumo.md",
+                                entrada.render_resumo(info, summary))
+        if name is not None:
+            jobstore.update_job(job_id, root, resumo_file=name, resumo_file_pending=None)
+            log(f"{job_id}: {name} criado em {job['entrada_folder']}")
+            return
+        folder, index_file = build_folder(job, mat, summary, entrada_root)
+        jobstore.update_job(job_id, root, resumo_file=None, resumo_file_pending=None, entrada_folder=folder,
+                            entrada_index=index_file, exported_at=time.time())
+        log(f"{job_id}: pasta original não encontrada; nova versão em {folder}")
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def finish(job_id: str, root: Path | None = None, entrada_root: Path | None = None) -> None:
+    """Right after a job is done. Never raises."""
+    try:
+        jobstore.update_job(job_id, root, export="pendente", export_next=None)
+        run_export(job_id, root, entrada_root)
+    except Exception as exc:  # noqa: BLE001 - the job itself is already done
+        log(f"{job_id}: pós-processamento falhou ({type(exc).__name__}); fica pendente")
+        try:
+            _export_pending(jobstore.load_job(job_id, root), root, f"erro interno ({type(exc).__name__})")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def retry_due(root: Path | None = None, entrada_root: Path | None = None, now: float | None = None) -> int:
+    """Pending exports and summaries whose time has come. Never raises; returns how many ran."""
+    now = time.time() if now is None else now
+    ran = 0
+    try:
+        jobs = jobstore.list_jobs(root)
+    except Exception:  # noqa: BLE001
+        return 0
+    for job in jobs:
+        if job.get("state") not in READY:
+            continue
+        try:
+            if job.get("export") == "pendente" and jobstore.as_number(job.get("export_next")) <= now:
+                ran += 1
+                run_export(job["id"], root, entrada_root)
+            elif job.get("export") == "ok" and (
+                    (job.get("resumo") == "pendente" and jobstore.as_number(job.get("resumo_next")) <= now)
+                    or (job.get("resumo") == "ok" and job.get("resumo_file_pending"))):
+                ran += 1
+                add_late_summary(job["id"], root, entrada_root)
+        except Busy:
+            continue
+        except Exception as exc:  # noqa: BLE001
+            log(f"{job['id']}: nova tentativa falhou ({type(exc).__name__})")
+    return ran
