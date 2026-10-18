@@ -1,0 +1,8 @@
+# Only for tests/bench/convert_ct2.py (throwaway container). ctranslate2 matches
+# the version inside speaches 0.8.3 so the converted model.bin loads there.
+--extra-index-url https://download.pytorch.org/whl/cpu
+ctranslate2==4.5.0
+transformers==4.46.3
+torch==2.5.1+cpu
+huggingface_hub==0.26.5
+safetensors==0.4.5

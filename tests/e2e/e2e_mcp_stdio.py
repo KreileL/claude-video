@@ -7,7 +7,7 @@ newline-delimited JSON-RPC: initialize → notifications/initialized →
 tools/list → tools/call. Validates TextContent + ImageContent and saves the
 result under --out.
 
-    python tests/e2e/e2e_mcp_stdio.py --url URL [--tool watch_video] [--allow-host H] --out DIR
+    python tests/e2e/e2e_mcp_stdio.py --url URL [--tool watch_video] [--allow-host H] [--entry v2] --out DIR
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from desktop_entry import docker_args, entry  # noqa: E402
+from desktop_entry import docker_args, docker_args_v2, entry, entry_v2  # noqa: E402
 
 PROTOCOL_VERSION = "2025-06-18"
 
@@ -93,12 +93,14 @@ def main() -> int:
     ap.add_argument("--expect-error", action="store_true", help="the call must return isError")
     ap.add_argument("--out", required=True)
     ap.add_argument("--timeout", type=float, default=900)
+    ap.add_argument("--entry", choices=["v1", "v2"], default="v1", help='"watch" (v1) or "watch-v2" Desktop entry')
     args = ap.parse_args()
 
-    desktop = entry()
+    desktop = entry() if args.entry == "v1" else entry_v2()
     argv = ["docker", *desktop["args"]]
     if args.allow_host:
-        argv = ["docker", *docker_args(extra_env={"WATCH_MCP_TEST_ALLOW_HOSTS": args.allow_host})]
+        make_args = docker_args if args.entry == "v1" else docker_args_v2
+        argv = ["docker", *make_args(extra_env={"WATCH_MCP_TEST_ALLOW_HOSTS": args.allow_host})]
     # Claude Desktop's environment: PATH plus the entry's env block, nothing else.
     env = {"PATH": os.environ["PATH"], **desktop["env"]}
 
