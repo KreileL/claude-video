@@ -26,6 +26,7 @@ JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 STATES = ("queued", "running", "done", "failed")
 ORPHAN_AGE = 3600.0
 ARCHIVED = "archived"  # v3: exported to the Holocron; never expires (v2 cleanup also skips it)
+EXPORT_LOCK = ".export.lock"  # v3: held by the exporter, and by cleanup while it removes a job
 # Touched by the worker every few seconds; not a job dir, so every scan skips it.
 HEARTBEAT_FILE = ".heartbeat"
 
@@ -209,6 +210,32 @@ def _remove(path: str) -> bool:
     return True
 
 
+def _evictable(job: dict | None) -> bool:
+    # v3: a done job still waiting for its Holocron note is kept until it is archived.
+    return (job is not None and job.get("state") in ("done", "failed")
+            and job.get("export") != "pendente")
+
+
+def _claim(path: str, name: str) -> bool:
+    """Take the job's export lock (exclusive create), then re-check on disk that the
+    job may still be removed. The exporter holds the same lock, so a job is never
+    deleted while it is being exported. The lock goes away with the directory."""
+    lock = os.path.join(path, EXPORT_LOCK)
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError:
+        return False
+    os.close(fd)
+    job = read_json(Path(path) / "job.json")
+    if _evictable(job if job is not None and job.get("id") == name else None):
+        return True
+    try:
+        os.unlink(lock)
+    except OSError:
+        pass
+    return False
+
+
 def cleanup(root: Path | None = None, *, ttl_seconds: float, max_bytes: int,
             now: float | None = None) -> list[str]:
     """Delete expired/over-cap finished jobs and stale orphan dirs; returns removed ids.
@@ -232,12 +259,12 @@ def cleanup(root: Path | None = None, *, ttl_seconds: float, max_bytes: int,
             continue
         if job.get("state") == ARCHIVED:
             continue  # v3: archived jobs are kept forever and do not count against the cap
-        if job.get("state") not in ("done", "failed"):
+        if not _evictable(job):
             sizes[name] = dir_size(Path(entry.path))
             continue
         updated = as_number(job.get("updated"))
         if now - updated > ttl_seconds:
-            if _remove(entry.path):
+            if _claim(entry.path, name) and _remove(entry.path):
                 removed.append(name)
             continue
         sizes[name] = dir_size(Path(entry.path))
@@ -247,7 +274,7 @@ def cleanup(root: Path | None = None, *, ttl_seconds: float, max_bytes: int,
     for _updated, name, path in sorted(finished):
         if total <= max_bytes:
             break
-        if _remove(path):
+        if _claim(path, name) and _remove(path):
             removed.append(name)
             total -= sizes[name]
     return removed

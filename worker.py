@@ -794,6 +794,30 @@ def heartbeat(every: float = 15.0) -> None:
         time.sleep(every)
 
 
+WORKER_LOCK = ".worker.lock"
+
+
+def lock_worker(root: Path | None = None, sleep=time.sleep):
+    """Exclusive ownership of the queue among v3 workers (flock, held for the
+    process lifetime; released by the kernel if the process dies). The v2 worker
+    does not take it, hence also wait_for_other_worker()."""
+    try:
+        import fcntl
+    except ImportError:  # Windows test runs
+        return None
+    fd = os.open((root or jobstore.JOBS_DIR) / WORKER_LOCK, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    warned = False
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            if not warned:
+                log("another v3 worker holds the queue; waiting")
+                warned = True
+            sleep(5)
+
+
 def wait_for_other_worker(root: Path | None = None, sleep=time.sleep) -> None:
     """Two workers on one queue would process the same job twice: while another
     worker's heartbeat is fresh (e.g. the v2 container still running), wait."""
@@ -820,6 +844,9 @@ def export_cli(argv: list[str]) -> int:
     except (jobstore.JobError, entrada.EntradaError, postproc.Busy) as exc:
         print(f"recusado: {exc}", file=sys.stderr)
         return 1
+    except Exception as exc:  # noqa: BLE001 - its text could carry a secret: type only
+        print(f"erro interno ({type(exc).__name__})", file=sys.stderr)
+        return 4
     if folder is None:
         job = jobstore.load_job(args[0])
         print(f"nota pendente: {job.get('export_error')}", file=sys.stderr)
@@ -832,6 +859,7 @@ def export_cli(argv: list[str]) -> int:
 def main() -> None:
     if sys.argv[1:2] == ["export"]:
         sys.exit(export_cli(sys.argv[2:]))
+    lock = lock_worker()  # noqa: F841 - kept open for the process lifetime
     wait_for_other_worker()
     threading.Thread(target=heartbeat, daemon=True).start()
     log(f"started: jobs={jobstore.JOBS_DIR} inbox={inbox.INBOX_DIR} fast={MODEL_FAST} accurate={MODEL_ACCURATE}")

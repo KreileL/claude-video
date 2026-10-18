@@ -219,6 +219,9 @@ def test_archived_jobs_never_expire_nor_count_against_the_cap(env):
     jid = done_job(jobs)
     postproc.finish(jid)
     old = done_job(jobs)
+    job = jobstore.load_job(old, jobs)
+    del job["export"]  # a pre-v3 done job: the only kind cleanup may evict
+    jobstore.write_json_atomic(jobs / old / "job.json", job)
     removed = jobstore.cleanup(jobs, ttl_seconds=1, max_bytes=0, now=time.time() + 10**7)
     assert removed == [old] and (jobs / jid / "job.json").exists()
     assert worker.cache_used(jobs) == 0
@@ -301,3 +304,176 @@ def test_call_count_records_only_real_http_calls(env, monkeypatch):
     monkeypatch.setattr(resumo, "summarize", quota)
     postproc.retry_due(now=time.time() + 10**6)
     assert jobstore.load_job(jid, jobs)["resumo_calls"] == 1
+
+
+# ── Codex v3 pass 1 ─────────────────────────────────────────────────────────
+
+
+def legacy(jobs, jid):
+    job = jobstore.load_job(jid, jobs)
+    del job["export"]
+    jobstore.write_json_atomic(jobs / jid / "job.json", job)
+
+
+def test_p1_cleanup_never_removes_a_job_while_it_is_being_exported(env, monkeypatch):
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    legacy(jobs, jid)  # a pre-v3 done job: evictable, exported by hand
+    seen = {}
+
+    def slow(segments, **kw):
+        seen["removed"] = jobstore.cleanup(jobs, ttl_seconds=1, max_bytes=0, now=time.time() + 10**7)
+        return resumo.Summary(SUMMARY, "gemini", "m", 1)
+
+    monkeypatch.setattr(resumo, "summarize", slow)
+    assert postproc.run_export(jid)
+    assert seen["removed"] == [] and (jobs / jid / "transcript.json").exists()
+    assert jobstore.load_job(jid, jobs)["state"] == "archived"
+
+
+def test_p1_done_jobs_waiting_for_their_note_are_not_evicted(env):
+    jobs, vault, _ = env
+    waiting = done_job(jobs)  # export="pendente"
+    old = done_job(jobs)
+    legacy(jobs, old)
+    assert jobstore.cleanup(jobs, ttl_seconds=1, max_bytes=0, now=time.time() + 10**7) == [old]
+    assert (jobs / waiting / "job.json").exists()
+
+
+def test_p1_a_locked_job_is_skipped_by_cleanup(env):
+    jobs, _, _ = env
+    jid = done_job(jobs)
+    legacy(jobs, jid)
+    (jobs / jid / jobstore.EXPORT_LOCK).write_text("1")
+    assert jobstore.cleanup(jobs, ttl_seconds=1, max_bytes=0, now=time.time() + 10**7) == []
+
+
+def test_p1_second_exporter_waits_for_the_lock_and_sees_fresh_state(env, monkeypatch):
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    seen = {}
+
+    def during_first(segments, **kw):
+        with pytest.raises(postproc.Busy):
+            postproc.run_export(jid)  # a second exporter while the first holds the lock
+        seen["busy"] = True
+        return resumo.Summary(SUMMARY, "gemini", "m", 1)
+
+    monkeypatch.setattr(resumo, "summarize", during_first)
+    assert postproc.run_export(jid) and seen["busy"]
+    with pytest.raises(entrada.EntradaError, match="já exportado"):
+        postproc.run_export(jid)
+    assert len([p for p in vault.iterdir() if not p.name.startswith(".")]) == 1
+
+
+def test_p1_finish_after_a_manual_export_does_not_publish_again(env):
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    assert worker.export_cli([jid]) == 0
+    postproc.finish(jid)
+    assert len([p for p in vault.iterdir() if not p.name.startswith(".")]) == 1
+
+
+def test_p1_late_summary_write_error_is_retried(env, monkeypatch):
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    monkeypatch.setattr(resumo, "summarize",
+                        lambda s, **kw: (_ for _ in ()).throw(resumo.ResumoError("erro de rede", transient=True)))
+    postproc.finish(jid)
+    monkeypatch.setattr(resumo, "summarize", lambda s, **kw: resumo.Summary(SUMMARY, "gemini", "m", 1))
+    real = entrada.add_file
+    monkeypatch.setattr(entrada, "add_file", lambda *a, **k: (_ for _ in ()).throw(OSError("disco")))
+    postproc.retry_due(now=time.time() + 10**6)
+    job = jobstore.load_job(jid, jobs)
+    assert job["resumo"] == "ok" and not job.get("resumo_entregue") and job["resumo_entrega_next"] > time.time()
+    monkeypatch.setattr(entrada, "add_file", real)
+    assert postproc.retry_due(now=time.time() + 10**6) == 1
+    assert (folder_of(vault, jid) / "Resumo.md").exists()
+    assert jobstore.load_job(jid, jobs)["resumo_entregue"] is True
+    assert postproc.retry_due(now=time.time() + 10**7) == 0
+
+
+def test_p1_crash_after_saving_the_summary_delivers_once(env, monkeypatch):
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    monkeypatch.setattr(resumo, "summarize",
+                        lambda s, **kw: (_ for _ in ()).throw(resumo.ResumoError("erro de rede", transient=True)))
+    postproc.finish(jid)
+    # summary.json written, then the process died before job.json said "ok"
+    jobstore.write_json_atomic(jobs / jid / postproc.SUMMARY_FILE, {"text": SUMMARY})
+    for _ in range(3):
+        postproc.retry_due(now=time.time() + 10**6)
+    folder = folder_of(vault, jid)
+    assert sorted(p.name for p in folder.glob("Resumo*.md")) == ["Resumo.md"]
+    job = jobstore.load_job(jid, jobs)
+    assert job["resumo"] == "ok" and job["resumo_entregue"] is True
+
+
+def test_p1_resumo_already_written_is_recognized_not_duplicated(env, monkeypatch):
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    monkeypatch.setattr(resumo, "summarize",
+                        lambda s, **kw: (_ for _ in ()).throw(resumo.ResumoError("erro de rede", transient=True)))
+    postproc.finish(jid)
+    monkeypatch.setattr(resumo, "summarize", lambda s, **kw: resumo.Summary(SUMMARY, "gemini", "m", 1))
+    real_update = jobstore.update_job
+    calls = {"n": 0}
+
+    def crash_once(job_id, root=None, **fields):
+        if fields.get("resumo_entregue") and calls["n"] == 0:
+            calls["n"] += 1
+            raise OSError("parou depois de gravar Resumo.md")
+        return real_update(job_id, root, **fields)
+
+    monkeypatch.setattr(jobstore, "update_job", crash_once)
+    postproc.retry_due(now=time.time() + 10**6)
+    postproc.retry_due(now=time.time() + 10**7)
+    assert sorted(p.name for p in folder_of(vault, jid).glob("Resumo*.md")) == ["Resumo.md"]
+
+
+@pytest.mark.parametrize("title", ["transcrição", "TRANSCRIÇÃO", "Resumo", "resumo"])
+def test_p1_titles_matching_our_file_names_in_any_case_still_export(env, title):
+    jobs, vault, _ = env
+    jid = done_job(jobs, title=title)
+    postproc.finish(jid)
+    job = jobstore.load_job(jid, jobs)
+    assert job["export"] == "ok" and job["entrada_index"].startswith("Nota - ")
+
+
+def test_p1_export_cli_never_prints_a_raw_exception(env, monkeypatch, capsys):
+    jobs, _, _ = env
+    jid = done_job(jobs)
+    secret = "FAKE-SECRET-IN-ERROR-0123456789"
+    monkeypatch.setattr(postproc, "run_export", lambda *a, **k: (_ for _ in ()).throw(ValueError(secret)))
+    assert worker.export_cli([jid]) == 4
+    assert secret not in capsys.readouterr().err
+
+
+def test_p1_explicit_again_retries_a_summary_that_gave_up(env, monkeypatch):
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    monkeypatch.setattr(resumo, "summarize", lambda s, **kw: (_ for _ in ()).throw(
+        resumo.ResumoError("requisição recusada (HTTP 400)", transient=False)))
+    monkeypatch.setattr(postproc, "PERMANENT_TRIES", 1)
+    postproc.finish(jid)
+    assert jobstore.load_job(jid, jobs)["resumo"] == "erro"
+    note = (folder_of(vault, jid) / "Meu vídeo.md").read_text(encoding="utf-8")
+    assert "Resumo não gerado" in note and "--again" in note
+    monkeypatch.setattr(resumo, "summarize", lambda s, **kw: resumo.Summary(SUMMARY, "gemini", "m", 1))
+    assert worker.export_cli([jid, "--again"]) == 0
+    assert jobstore.load_job(jid, jobs)["resumo"] == "ok"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="flock (runs in the Linux suite)")
+def test_p1_only_one_v3_worker_owns_the_queue(env):
+    jobs, _, _ = env
+    first = worker.lock_worker(jobs)
+    sleeps = []
+
+    def release(seconds):
+        sleeps.append(seconds)
+        os.close(first)  # the first worker exits
+
+    second = worker.lock_worker(jobs, sleep=release)
+    assert sleeps == [5] and second is not None
+    os.close(second)
