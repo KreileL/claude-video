@@ -326,7 +326,7 @@ A entrada `watch-v2` do `claude_desktop_config.json` (gerada por `entry_v2()` em
 ### Fluxo de uso
 
 1. `list_inbox()`: lista os vídeos e áudios da caixa de entrada (mp4, mkv, mov, webm, m4v, mp3, m4a, wav, ogg, opus).
-2. `analyze_video(source, language="pt", quality="auto", terms=None)`: `source` é uma URL ou só o **nome** de um arquivo da caixa de entrada. Devolve um `job_id` na hora. `terms` são nomes próprios e jargões que aparecem no vídeo, para ajudar a transcrição. Pedir de novo o mesmo vídeo com os mesmos parâmetros reaproveita o trabalho existente.
+2. `analyze_video(source, language="auto", quality="auto", terms=None)` (na v3 o padrão é `"auto"`; veja "MCP local v3"): `source` é uma URL ou só o **nome** de um arquivo da caixa de entrada. Devolve um `job_id` na hora. `terms` são nomes próprios e jargões que aparecem no vídeo, para ajudar a transcrição. Pedir de novo o mesmo vídeo com os mesmos parâmetros reaproveita o trabalho existente.
 3. `job_status(job_id)`: estado, etapa, progresso em % e estimativa. Em caso de falha, traz o erro em português.
 4. `search_transcript(job_id, query)`: trechos com timestamps. A busca ignora acentos e maiúsculas.
 5. `watch_video(job_id=..., start=..., end=..., max_frames=24, detail="balanced")`: frames e transcrição do trecho, na hora, a partir do cache, sem novo download nem retranscrição. Mantém o orçamento de ~800 KB de imagens.
@@ -416,6 +416,9 @@ A v3 (branch `mcp-v3`, imagem `watch-mcp:v3`) mantém tudo da v2 e acrescenta:
 2. **Arquivamento:** o trabalho exportado fica arquivado no volume `watch-mcp-jobs` sem prazo (sem o vídeo). `search_transcript` e `watch_video(job_id=...)` funcionam nele a qualquer momento.
 3. **Bot do Telegram** (`@InstWhisperBot`): mande um link (Instagram, YouTube, TikTok) e ele enfileira o trabalho e avisa quando a nota estiver pronta.
 4. **Resumo automático** pelo Gemini (`gemini-3.8-flash`), ou Claude, ou desligado.
+5. **Idioma automático** em todas as origens: `language="auto"` é o padrão de `analyze_video`, `watch_video` e `transcribe_video` (um código de 2 letras força o idioma). Em vídeos longos, maioria em 3 amostras de fala; o contexto brasileiro no prompt só entra quando o idioma decidido é `pt`.
+6. **URL limpa:** parâmetros de rastreio (`igsh`, `dlrf`, `utm_*`, `si`, `pp`, os do TikTok) saem antes de gravar a origem.
+7. **"Sem fala no áudio"** quando o vídeo não tem fala, em vez de "Whisper falhou".
 
 ### Como funciona
 
