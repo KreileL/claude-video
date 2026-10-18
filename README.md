@@ -279,6 +279,87 @@ A variável `WATCH_MCP_TEST_ALLOW_HOSTS` existe só para os testes de ponta a po
 .venv\Scripts\python tests\e2e\e2e_mcp_stdio.py --url <URL> --out <pasta-temp>    # protocolo MCP real via stdio
 ```
 
+## MCP local v2
+
+A v2 (branch `mcp-v2`, imagem `watch-mcp:v2`, entrada `watch-v2` no Claude Desktop) acrescenta três coisas à v1, que continua intacta (`watch-mcp:latest`, entrada `watch`):
+
+1. **Caixa de entrada local:** arquivos em `D:\Inbox` (montada somente leitura).
+2. **Vídeos longos:** até 4 h, processados em segundo plano, sem o limite de 15 min.
+3. **Transcrição mais precisa em português do Brasil:** `language="pt"`, prompt com grafia e vocabulário brasileiros e o modelo escolhido pelo benchmark abaixo.
+
+### Como funciona
+
+O Claude Desktop inicia o servidor MCP a cada sessão e uma chamada de ferramenta não comporta horas de processamento. Por isso os trabalhos longos rodam no serviço **`watch-worker`** (compose, sempre ligado, mesma imagem), que processa uma fila em disco no volume **`watch-mcp-jobs`**. O servidor stdio só valida, enfileira e lê os resultados.
+
+Para cada trabalho, o worker:
+
+1. baixa a URL (pelo mesmo proxy `netguard` da v1) ou abre o arquivo da caixa de entrada;
+2. extrai o áudio e monta um índice de frames (cortes de cena mais uma grade de tempo, JPEG com lado maior de 512 px);
+3. **apaga o vídeo**;
+4. transcreve em blocos de ~5 min, cortados em silêncios, gravando cada bloco assim que termina. Se o worker reiniciar, ele retoma do bloco seguinte, sem refazer o que já estava pronto.
+
+### Subir
+
+```powershell
+docker build -t watch-mcp:v2 .
+docker compose -p watch-mcp up -d          # watch-whisper (inalterado) + watch-worker
+```
+
+A entrada `watch-v2` do `claude_desktop_config.json` (gerada por `entry_v2()` em `tests/e2e/desktop_entry.py`) usa os mesmos limites de container da v1 e monta também `watch-mcp-jobs` em `/jobs` e `D:/Inbox` em `/inbox` (somente leitura). Para usar outra pasta, defina `WATCH_INBOX_DIR` antes do `docker compose up` e ajuste o `--mount` da entrada.
+
+### Fluxo de uso
+
+1. `list_inbox()`: lista os vídeos e áudios da caixa de entrada (mp4, mkv, mov, webm, m4v, mp3, m4a, wav, ogg, opus).
+2. `analyze_video(source, language="pt", quality="auto", terms=None)`: `source` é uma URL ou só o **nome** de um arquivo da caixa de entrada. Devolve um `job_id` na hora. `terms` são nomes próprios e jargões que aparecem no vídeo, para ajudar a transcrição. Pedir de novo o mesmo vídeo com os mesmos parâmetros reaproveita o trabalho existente.
+3. `job_status(job_id)`: estado, etapa, progresso em % e estimativa. Em caso de falha, traz o erro em português.
+4. `search_transcript(job_id, query)`: trechos com timestamps. A busca ignora acentos e maiúsculas.
+5. `watch_video(job_id=..., start=..., end=..., max_frames=24, detail="balanced")`: frames e transcrição do trecho, na hora, a partir do cache, sem novo download nem retranscrição. Mantém o orçamento de ~800 KB de imagens.
+6. `list_jobs()`: os trabalhos recentes.
+
+`watch_video(url=...)` e `transcribe_video(url)` continuam iguais à v1 para vídeos de até 15 min. Um vídeo mais longo recebe a sugestão de usar `analyze_video`.
+
+### Retenção do cache
+
+Ficam em `watch-mcp-jobs`, por trabalho:
+- `job.json`;
+- `meta.json`, só com os campos de exibição;
+- `transcript.json`, com os segmentos;
+- `index.json` e `frames/`.
+
+O vídeo e o áudio são apagados assim que deixam de ser necessários. Trabalhos concluídos ou com falha são apagados **7 dias** depois da última atualização. Se o cache passar de **20 GB**, os mais antigos saem primeiro. A limpeza roda a cada 10 min e nunca toca em trabalhos na fila ou em andamento. Tudo é configurável no serviço `watch-worker` do `docker-compose.yml`:
+
+| Variável | Padrão | O quê |
+|---|---|---|
+| `WATCH_JOB_MAX_DURATION` | 14400 (4 h) | duração máxima da mídia |
+| `WATCH_JOB_MAX_DOWNLOAD_BYTES` | 4 GiB | teto rígido de download por trabalho (contado pelo proxy) |
+| `WATCH_JOB_TIMEOUT` | 28800 (8 h) | tempo total por trabalho |
+| `WATCH_JOB_TTL` | 604800 (7 dias) | retenção depois da última atualização |
+| `WATCH_JOBS_MAX_BYTES` | 20 GiB | teto do cache inteiro |
+| `WATCH_MODEL_FAST` / `WATCH_MODEL_ACCURATE` | ver benchmark | modelos do `quality="auto"` |
+
+### Benchmark pt-BR
+
+_Resultados em andamento; a tabela completa e a decisão ficam na seção "v2" do NOTES-mcp.md._
+
+### Promover a v2 para substituir a v1
+
+Quando decidir:
+
+1. **Copie a entrada:** em `%APPDATA%\Claude\claude_desktop_config.json`, troque os `args` da entrada `watch` pelos da `watch-v2` (ou apague a `watch` e renomeie `watch-v2` para `watch`). Faça um backup antes.
+2. **Reinicie o Claude Desktop.**
+3. **Opcional, para manter um único nome de imagem:** `docker tag watch-mcp:v2 watch-mcp:latest`. A imagem antiga continua acessível pelo ID enquanto não for removida, e dá para voltar com `docker tag <id-antigo> watch-mcp:latest`.
+4. **Branches:** faça o merge do `mcp-v2` no branch que você usa como principal.
+
+Para voltar atrás, restaure o backup do config e reinicie o Claude Desktop. O `watch-worker` pode continuar ligado; ele não interfere na v1.
+
+### Testes da v2
+
+```powershell
+.venv\Scripts\python -m pytest -q                                                     # unitários (worker, fila, caixa de entrada, busca)
+.venv\Scripts\python tests\e2e\e2e_v2_long.py --work <pasta-temp> --restart-at-chunk 3  # vídeo sintético longo + retomada
+.venv\Scripts\python tests\e2e\e2e_mcp_stdio.py --entry v2 --url <reel> --out <pasta-temp>   # compatibilidade com reels
+```
+
 ## Structure
 
 ```

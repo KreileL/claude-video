@@ -262,3 +262,162 @@ Non-blocking:
   APPDATA, LOCALAPPDATA and ProgramData. os.environ upper-cases names on Windows,
   so they are matched case-insensitively (the first write missed two of them).
 - Claude Desktop was not restarted.
+
+# v2 (branch mcp-v2)
+
+v2 adds a local inbox, long videos as background jobs and better Brazilian
+Portuguese transcription, as image `watch-mcp:v2` and Desktop entry
+`watch-v2`. v1 (`watch-mcp:latest`, entry `watch`) was not touched: the image
+was never rebuilt or retagged, and the `watch` entry is byte-for-byte what was
+installed. `mcp-v2` started from `mcp-local` (16dc2ed); nothing was merged back.
+
+## Architecture — why an always-on worker with a disk queue
+
+Claude Desktop starts the stdio server per session (`docker run -i --rm`), and
+one tool call cannot last hours, so the work must outlive the call.
+Alternatives considered:
+
+- **A detached process inside the stdio container.** It dies with the
+  container when Desktop closes (`--rm`), so this was rejected.
+- **A worker with an HTTP API.** It would open a listening port inside
+  watch-mcp-net and need auth. More attack surface and more code than a
+  directory, so this was rejected.
+- **A worker that polls a queue of job directories on a named volume
+  (chosen).** It needs no port and no new protocol. State survives restarts
+  and can be inspected. Resume is per stage, because each stage is skipped when
+  its output exists.
+
+How the chosen design works:
+
+- **Ownership:** the stdio server only creates `job.json` (state `queued`)
+  and reads. Every later write belongs to the worker. job.json is replaced
+  atomically (temp file + `os.replace`), so there is a single writer and no
+  locks (`jobstore.py`).
+- **Service:** `watch-worker` (compose) runs the same image with entrypoint
+  `worker.py`. It runs one job at a time, because Whisper on 8 CPUs is the
+  bottleneck anyway. It writes `/jobs/.heartbeat` every 15 s, and `job_status`
+  / `analyze_video` warn when it is stale ("rode docker compose -p watch-mcp
+  up -d").
+- **Job directory** (`/jobs/<32-hex id>/`):
+  - `job.json`
+  - `meta.json`: display fields only, never the raw yt-dlp JSON with format
+    URLs or headers
+  - `plan.json`: the chunk plan
+  - `index.json` + `frames/f_NNNNN.jpg`
+  - `chunks/NNNN.json`: one per transcribed chunk
+  - `transcript.json`
+  - `work/`: download and audio, removed when no longer needed
+
+### Source file: neither kept nor re-read — the frame index is kept
+
+The brief left the choice between keeping the source for a TTL and re-reading
+it from the origin. Decision: neither. The index (scene cuts + a time grid,
+512 px JPEG) is computed once, and the video is deleted right after audio
+extraction and indexing.
+
+- **Re-reading the origin** would need network again, and the origin can
+  change, disappear or rate-limit. Inbox files can also be moved.
+- **Keeping the source** costs gigabytes per job.
+- **The index:**
+  - Its grid interval is `max(2 s, duration/2500)`: 2 s for anything up to
+    83 min, 5.8 s for 4 h.
+  - Scene cuts (threshold 0.3) are added on top.
+  - A cap of 7500 frames bounds noisy video.
+- **Trade-off:** inside a short range, frames are at most one grid interval
+  apart. For "what is on screen at 1:23:45" that is enough; slide or scene
+  changes are cuts.
+- **Cost:** `watch_video(job_id=…)` never runs ffmpeg in the server; it reads
+  JPEGs and JSON.
+
+### Short videos keep the direct path
+
+The brief keeps `watch_video(url)` / `transcribe_video(url)` as in v1. That
+path still runs watch.py inside the stdio container for videos up to 15 min,
+under every v1 limit: 500 MiB, 900 s, 1 GB tmpfs. This is the one place the
+stdio server does real work. It is deliberate, for compatibility. A longer
+URL gets an error pointing to `analyze_video`.
+
+### Long-job limits (env on watch-worker; defaults)
+
+| Limit | Default | Enforced by |
+|---|---|---|
+| Media duration | 4 h (`WATCH_JOB_MAX_DURATION`) | yt-dlp metadata + `--match-filter`; ffprobe of the file (inbox and downloaded); decoding capped with `-t` at the probed duration |
+| URL download | 4 GiB (`WATCH_JOB_MAX_DOWNLOAD_BYTES`) | netguard proxy budget (hard, aggregate) + `--max-filesize` |
+| Time per job | 8 h (`WATCH_JOB_TIMEOUT`) | deadline from the first start; every subprocess gets the remaining time; process-group kill |
+| Whisper request | 1800 s (`WATCH_WHISPER_TIMEOUT`) | per chunk; 3 retries (30/60/120 s) after waiting for `/health` |
+| Disk | 20 GiB for the whole cache (`WATCH_JOBS_MAX_BYTES`) | checked before audio/index; cleanup evicts oldest finished jobs |
+| Retention | 7 days after the last update (`WATCH_JOB_TTL`) | cleanup every 10 min; never queued/running; orphan dirs after 1 h |
+| Resume attempts | 3 | a job that keeps killing the worker fails instead of looping |
+| Work dir | volume, not tmpfs | `/jobs/<id>/work`; worker tmpfs is 512 MiB (yt-dlp/deno caches, cookie copy) |
+
+Transcription:
+- **Chunks:** ~300 s (`WATCH_CHUNK_SECONDS`), cut at the silence midpoint
+  nearest each boundary (±30 s, ffmpeg `silencedetect`).
+- **Resume:** each chunk is written to `chunks/NNNN.json` as soon as it
+  finishes, and a restart skips the existing ones (verified by the E2E test
+  below).
+- **Progress and ETA:** progress follows transcribed audio seconds. The ETA
+  comes from the measured speed of the chunks done in this run.
+
+### Cache reuse
+
+The cache key is a hash of:
+- the source
+- for an inbox file, its size and mtime
+- language
+- quality
+- the sorted terms
+
+`analyze_video` with the same key returns the existing queued, running or done
+job instead of a new one.
+
+### Security controls added in v2 (all v1 controls kept)
+
+| Control | Where | Test |
+|---|---|---|
+| Inbox names: bare name only; no `/ \ :`, control/format characters, leading dot, absolute or drive paths; ≤ 255 chars; allowed extensions only | `inbox.check_name` | `test_inbox.py`, `test_mcp_v2.py::test_analyze_refuses_bad_inbox_names` |
+| Inbox file: `lstat` (no symlink), regular file, parent must be the inbox; opened once with `O_NOFOLLOW`; ffmpeg/ffprobe read `/proc/self/fd/N` (the validated inode, whatever happens to the name: TOCTOU) | `inbox.resolve/open_media`, `worker.Source` | symlink tests (Linux), Docker probe |
+| Local media: `-protocol_whitelist file` **and** `-format_whitelist mov,matroska,mp3,wav,ogg`, then the probed demuxer forced with `-f`; ffprobe must find real audio/video (attached cover art does not count) and a positive duration | `inbox.input_args/probe` | concat/HLS/text-as-mp4 tests; `test_probe_never_lets_concat_open_other_files` |
+| Downloaded files get the same probe + fd discipline | `worker.open_source` | `test_url_job_downloads_through_proxy…` |
+| job_id = `secrets.token_hex(16)`, validated by `^[0-9a-f]{32}$` before any path is built | `jobstore.job_path` | `test_jobstore.py`, `test_job_ids_are_validated` |
+| Nothing outside `/jobs`; scans skip symlinks and foreign names; corrupt job.json is skipped, never served | `jobstore` | `test_jobstore.py` |
+| No cookies or secrets in the cache: the cookie copy lives on the worker tmpfs and is deleted; `meta.json` keeps display fields only; errors are scrubbed | `worker.private_cookies/write_meta/fail` | `test_url_job_downloads_through_proxy_and_keeps_no_cookies` |
+| `watch_video(job_id)` serves only `frames/f_NNNNN.jpg` of that job (resolved path, JPEG bytes), within the 800 KiB budget | `jobview.pick_frames`, `encode_frames` | `test_watch_job_never_serves_files_outside_its_frames`, `test_watch_job_respects_image_budget` |
+| `terms`: ≤ 30, ≤ 60 chars, no control characters; `language`: 2 letters or `auto`; prompt ≤ 800 chars | `mcp_server.check_terms`, `worker.build_prompt` | `test_analyze_validates_url_language_and_terms` |
+| Worker container: uid 10001, `read_only`, noexec tmpfs, `cap_drop: ALL`, `no-new-privileges`, 4 CPUs / 3 GB / 256 pids, no ports, inbox and secrets read-only | `docker-compose.yml` | `docker inspect` (below) |
+
+## Environment findings (outside the code)
+
+- **Kaspersky intercepts part of Docker's HTTPS.** About one TLS handshake
+  in three, from containers to huggingface.co, came back signed by "Kaspersky
+  Anti-Virus Personal Root Certificate". Containers do not trust that root,
+  so verification fails ("self-signed certificate in certificate chain"):
+  correct behaviour, and nothing was changed to trust it.
+  - **Downloads here:** model files were fetched on the host instead (pinned
+    revisions) and installed offline.
+  - **Impact on v1/v2:** the same interception can make an occasional yt-dlp
+    or model download fail.
+  - **Option for the user:** exclude Docker traffic from Kaspersky's
+    encrypted-connection scanning.
+- **Kokoro TTS cannot run inside watch-mcp-whisper.** Its phonemizer copies
+  `libespeak-ng.so` to `/tmp` and dlopens it, and the hardened container's
+  tmpfs is `noexec`. watch-whisper was left as is, because changing it would
+  recreate the v1 service. The benchmark's Kokoro voices were synthesized by a
+  throwaway speaches container (`watch-mcp-tts`, models volume read-only,
+  removed right after).
+- **Incident: the benchmark hung watch-whisper for about 30 min (02:26–02:55,
+  2026-10-18).**
+  - **Trigger:** the first benchmark runner unloaded models explicitly
+    (`DELETE /api/ps/{model}`) between candidates. In speaches 0.8.3 that call,
+    made while the idle-TTL offload was already scheduled, logged "unloaded"
+    but never returned, and left the model manager locked.
+  - **Impact:** every later transcription request hung. `/health` stayed
+    green, so the healthcheck did not notice. v1 transcription was unavailable
+    during that window.
+  - **Detection:** confirmed with a 15 s clip that timed out at 30 s.
+  - **Fix:** the stuck benchmark container was stopped and watch-mcp-whisper
+    restarted with `docker restart`: same container ID and same compose config
+    hash; only the start time changed. A real transcription worked right after.
+  - **Prevention:** the runner never unloads explicitly. It waits for the
+    120 s TTL to empty `/api/ps`. Neither the MCP server nor the worker ever
+    calls `/api/ps`.
