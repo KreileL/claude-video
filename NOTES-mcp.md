@@ -473,3 +473,152 @@ Confirmed by Codex:
 - container flags, by inspection.
 
 "Fora do diff": nothing new.
+
+## pt-BR benchmark (tests/bench/)
+
+Reproducible pipeline (all scripts in `tests/bench/`, command list in RESULTS.md's header and the README):
+
+1. **Fetch:** `fetch_models.py` downloads the pinned revisions on the host.
+2. **Install:** `install_models.py` converts the fine-tunes with ctranslate2
+   4.5.0 (the version inside speaches) and installs them into the
+   watch-mcp-models cache. It runs offline in a throwaway container.
+3. **Real clips:** `fetch_real.py` downloads them.
+4. **Run:** `run_bench.py` transcribes, from a container on watch-mcp-net:
+   - `tts`: synthesize the corpus
+   - `refs`: draft the approximate references
+   - `run <models>` / `run-pieces 30 <models>`
+5. **Report:** `report.py` re-scores everything against the current
+   references and writes the table.
+
+Every request is `language="pt"`. Metrics:
+- **WER:** normalized (casefold, no punctuation, numbers, money, dates,
+  percentages and ordinals spelled out in Brazilian Portuguese on both sides,
+  so "R$ 1.500,00" equals "mil e quinhentos reais"; `metrics.py`).
+- **Separate counts:** numbers, proper names and jargon missed on the TTS
+  corpus.
+- **Speed:** compute seconds per minute of audio, warm, on the Xeon E5-2680 v4
+  with 8 CPUs.
+- **RAM:** the speaches container's peak while the model ran.
+
+### Audio (always Brazilian)
+
+- **TTS:** 20 sentences with numbers, dates, money in reais, Brazilian names,
+  slang, IT and agro terms (`corpus_ptbr.json`). Five Brazilian voices read
+  them in turns: Piper pt_BR faber and edresson, Kokoro pf_dora, pm_alex and
+  pm_santa. Kokoro was synthesized in a throwaway speaches, see "Environment
+  findings". The reference is exact (the TTS text).
+- **Real speech:**
+  - Reel DeniXRTs5Mw (70 s, a gamer's narration).
+  - Nerdologia `kyGu9lTr_jM` (6.4 min narration). Reference: its official,
+    manually made pt captions. Manual captions sometimes condense speech,
+    which puts a floor of a few % under everyone.
+  - Podpah `gwAwKfW-Q8w`, first 3 min (spontaneous conversation, laughter,
+    crosstalk).
+- **Approximate references (reel and Podpah):**
+  - Drafted by `Systran/faster-whisper-large-v3`, which is not a candidate.
+  - The Podpah draft was made in 30 s pieces: the whole-clip draft fell into a
+    repetition loop.
+  - Reviewed by reading. I cannot listen to audio, so only context-certain
+    fixes were made: reel "sobrevivo"→"sobrevivi" and "palio"→"falou";
+    Podpah "Quanto o Edwards"→"Contra o Edwards" (×2) and
+    "esterinha"→"esteirinha".
+  - **They are approximate.** Large-v3 shares lineage with turbo, which may
+    favour turbo slightly on that column.
+
+### Candidates and licenses (checked on each model card)
+
+| Model | Source | License |
+|---|---|---|
+| `Systran/faster-whisper-small` | OpenAI Whisper small, ct2 | MIT |
+| `Systran/faster-whisper-medium` | OpenAI Whisper medium, ct2 | MIT |
+| `deepdml/faster-whisper-large-v3-turbo-ct2` | Whisper large-v3-turbo, ct2 | MIT |
+| `watch-mcp/distil-whisper-large-v3-ptbr-ct2` | `freds0/distil-whisper-large-v3-ptbr` @3edf997 — Brazilian Portuguese (Common Voice 16 + a private pt-BR set), converted here | MIT |
+| `watch-mcp/whisper-medium-portuguese-ct2` | `pierreguillou/whisper-medium-portuguese` @9ca8ecf — Portuguese Common Voice 11, converted here | Apache-2.0 |
+| `Systran/faster-whisper-large-v3` | reference drafts only | MIT |
+
+Ready-made ct2 copies of the freds0 model exist on the Hub, but without a
+license tag, so it was converted here from the MIT-licensed original.
+
+### Results
+
+Prompt modes:
+- `none`: no prompt.
+- `ptbr`: Brazilian context ("Transcrição em português do Brasil… ônibus,
+  celular, time, trem, registro…").
+- `ptbr+terms`: the context plus the clip's proper names and jargon.
+
+RAM caveat: the non-pieces runs were on the shared watch-whisper, whose
+process keeps heap between models (4 GB limit hit). The pieces runs were on
+the fresh watch-whisper-v2 with `MALLOC_ARENA_MAX=2`. Compare RAM within a
+group only.
+
+| Modelo | Prompt | WER TTS | WER real (legenda oficial) | WER real (ref. aproximada) | Números perdidos (TTS) | Nomes perdidos (TTS) | Termos perdidos (TTS) | s por min de áudio | RAM pico (MiB) |
+|---|---|---|---|---|---|---|---|---|---|
+| deepdml/faster-whisper-large-v3-turbo-ct2 | none | 4.9% | 12.0% | 9.1% | 0/16 | 4/22 | 7/42 | 30.1 | 4038 |
+| deepdml/faster-whisper-large-v3-turbo-ct2 | ptbr | 5.2% | 11.1% | 11.8% | 0/16 | 3/22 | 8/42 | 32.2 | 4038 |
+| deepdml/faster-whisper-large-v3-turbo-ct2 | ptbr+terms | 2.7% | 11.3% | 9.2% | 0/16 | 2/22 | 3/42 | 33.5 | 4038 |
+| deepdml/faster-whisper-large-v3-turbo-ct2 (pedaços de 30 s) | none | 4.9% | 12.0% | 10.4% | 0/16 | 4/22 | 7/42 | 34.4 | 2169 |
+| deepdml/faster-whisper-large-v3-turbo-ct2 (pedaços de 30 s) | ptbr | 5.2% | 12.0% | 8.7% | 0/16 | 3/22 | 8/42 | 32.1 | 2169 |
+| deepdml/faster-whisper-large-v3-turbo-ct2 (pedaços de 30 s) | ptbr+terms | 2.7% | 11.8% | 7.8% | 0/16 | 2/22 | 3/42 | 30.8 | 2169 |
+| Systran/faster-whisper-medium | none | 7.0% | 9.8% | 13.3% | 1/16 | 5/22 | 6/42 | 33.2 | 3765 |
+| Systran/faster-whisper-medium | ptbr | 7.3% | 9.9% | 12.8% | 1/16 | 5/22 | 7/42 | 34.0 | 3765 |
+| Systran/faster-whisper-medium | ptbr+terms | 4.9% | 11.4% | 12.8% | 1/16 | 3/22 | 2/42 | 34.1 | 3765 |
+| Systran/faster-whisper-small | none | 11.3% | 11.8% | 18.3% | 3/16 | 7/22 | 11/42 | 12.3 | 2461 |
+| Systran/faster-whisper-small | ptbr | 10.7% | 6.4% | 19.7% | 2/16 | 8/22 | 10/42 | 12.0 | 2461 |
+| Systran/faster-whisper-small | ptbr+terms | 9.5% | 7.6% | 57.3% | 3/16 | 3/22 | 6/42 | 11.4 | 2461 |
+| watch-mcp/distil-whisper-large-v3-ptbr-ct2 | none | 8.5% | 91.5% | 66.7% | 3/16 | 3/22 | 12/42 | 21.6 | 3775 |
+| watch-mcp/distil-whisper-large-v3-ptbr-ct2 | ptbr | 16.5% | 88.4% | 74.0% | 8/16 | 6/22 | 11/42 | 21.6 | 3775 |
+| watch-mcp/distil-whisper-large-v3-ptbr-ct2 | ptbr+terms | 21.6% | 88.9% | 77.9% | 9/16 | 10/22 | 13/42 | 22.4 | 3775 |
+| watch-mcp/distil-whisper-large-v3-ptbr-ct2 (pedaços de 30 s) | none | 8.5% | 19.7% | 14.6% | 3/16 | 3/22 | 12/42 | 23.4 | 1465 |
+| watch-mcp/distil-whisper-large-v3-ptbr-ct2 (pedaços de 30 s) | ptbr | 16.5% | 61.2% | 33.2% | 8/16 | 6/22 | 11/42 | 22.3 | 1465 |
+| watch-mcp/distil-whisper-large-v3-ptbr-ct2 (pedaços de 30 s) | ptbr+terms | 21.6% | 53.3% | 39.1% | 9/16 | 10/22 | 13/42 | 22.4 | 1465 |
+| watch-mcp/whisper-medium-portuguese-ct2 | none | 20.1% | 7.5% | 48.9% | 4/16 | 9/22 | 11/42 | 28.7 | 4095 |
+| watch-mcp/whisper-medium-portuguese-ct2 | ptbr | 9.5% | 9.3% | 26.0% | 3/16 | 6/22 | 9/42 | 33.8 | 4095 |
+| watch-mcp/whisper-medium-portuguese-ct2 | ptbr+terms | 4.9% | 12.0% | 44.5% | 2/16 | 2/22 | 3/42 | 30.2 | 4095 |
+
+### Observations
+
+- **large-v3-turbo** is the most accurate on real Brazilian speech: reel 2.3%,
+  Podpah 12%, approximate references 9.1% (7.8% in 30 s pieces with terms).
+  It is also best on the TTS corpus with terms (2.7%, 0/16 numbers missed).
+  At ~0.53× real time it is faster than medium.
+- **small** runs at 0.2× real time. On the reel it gives 7.5% (13 s for 70 s),
+  on Nerdologia 11.8%. It is weak on spontaneous crosstalk (Podpah 23%) and
+  misses more numbers and names.
+- **medium** is best on the official-caption narration (9.8%), behind turbo
+  elsewhere, and slower.
+- **distil-pt-BR (freds0)**, the only candidate trained mostly on Brazilian
+  data, is excellent for ~30 s and then degenerates into ". . . ." under
+  speaches' conditioned long-form decoding (Nerdologia 91%). In fresh 30 s
+  pieces it recovers (19.7% / 14.6%) but stays behind turbo, and any prompt
+  hurts it badly.
+- **pierreguillou medium-pt** is very good on read narration (Nerdologia
+  7.5%) and poor on everything else (reel 28%, Podpah 58%). That fits a
+  Common Voice fine-tune.
+- **Prompt:** the Brazilian context *alone* did not help consistently. Turbo
+  got worse on the approximate references (9.1→11.8%); small got better on
+  Nerdologia and worse on Podpah. With the clip's terms, names and jargon
+  improved for every model: turbo missed names 4→2 and terms 7→3; medium
+  missed terms 6→2.
+  - Caveat: on the TTS corpus the terms are the very words scored, which is
+    the intended use (the caller names the proper nouns), but it inflates
+    that gain.
+  - small + prompt fell into a repetition loop on Podpah (57%). The worker's
+    loop guard covers that in production.
+- **Repetition loops:** they happened to large-v3 (draft) and to small +
+  prompt. This led to the worker's loop guard (re-transcribe a looping chunk
+  in 30 s pieces).
+
+### Decision (quality="auto")
+
+- **Short media (≤ 15 min) and the direct reel path:** `Systran/faster-whisper-small`.
+  It is the fastest with an acceptable WER on reels (6.6–7.5% on the reel, 2.6×
+  faster than turbo). `quality="accurate"` in `analyze_video` gives turbo
+  for a short video when accuracy matters more than time.
+- **Long background jobs:** `deepdml/faster-whisper-large-v3-turbo-ct2`, the
+  most accurate in pt-BR overall, at ~0.53× real time on 8 CPUs, so 4 h of
+  audio is about 2 h of transcription.
+- **Prompt:** sent only when the caller gives `terms` (Brazilian context +
+  terms); no prompt otherwise. `language="pt"` is always explicit by default.
+- **Isolation:** all v2 transcription runs on `watch-whisper-v2`, never on
+  the v1 service (see the RAM note above and the compose comment).

@@ -87,7 +87,7 @@ def make_speech(minutes: int, out_dir: Path) -> None:
         f"phrases = {json.dumps(phrases, ensure_ascii=False)}\n"
         "for m, text in phrases.items():\n"
         f"    body = json.dumps({{'model': {TTS_MODEL!r}, 'voice': 'faber', 'input': text, 'response_format': 'wav'}}).encode()\n"
-        "    r = urllib.request.Request('http://watch-whisper:8000/v1/audio/speech', data=body, headers={'Content-Type': 'application/json'})\n"
+        "    r = urllib.request.Request('http://watch-whisper-v2:8000/v1/audio/speech', data=body, headers={'Content-Type': 'application/json'})\n"
         "    open(f'/out/m{int(m):03d}.wav', 'wb').write(urllib.request.urlopen(r, timeout=300).read())\n"
     )
     sh(["docker", "run", "--rm", "--network", NETWORK, "--read-only", "--cap-drop", "ALL",

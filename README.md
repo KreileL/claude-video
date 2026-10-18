@@ -285,11 +285,13 @@ A v2 (branch `mcp-v2`, imagem `watch-mcp:v2`, entrada `watch-v2` no Claude Deskt
 
 1. **Caixa de entrada local:** arquivos em `D:\Inbox` (montada somente leitura).
 2. **Vídeos longos:** até 4 h, processados em segundo plano, sem o limite de 15 min.
-3. **Transcrição mais precisa em português do Brasil:** `language="pt"`, prompt com grafia e vocabulário brasileiros e o modelo escolhido pelo benchmark abaixo.
+3. **Transcrição mais precisa em português do Brasil:** `language="pt"` explícito, o modelo escolhido pelo benchmark abaixo e, quando você informa `terms`, um prompt com contexto brasileiro e esses termos.
 
 ### Como funciona
 
 O Claude Desktop inicia o servidor MCP a cada sessão e uma chamada de ferramenta não comporta horas de processamento. Por isso os trabalhos longos rodam no serviço **`watch-worker`** (compose, sempre ligado, mesma imagem), que processa uma fila em disco no volume **`watch-mcp-jobs`**. O servidor stdio só valida, enfileira e lê os resultados.
+
+A v2 transcreve no seu próprio Whisper, **`watch-whisper-v2`**: mesma imagem fixada, modelos do mesmo volume em somente leitura, 8 GB. No benchmark, um modelo grande deixou o `watch-whisper` da v1 no limite de memória (4 GB). Com serviços separados, um trabalho longo nunca derruba as transcrições da v1.
 
 Para cada trabalho, o worker:
 
@@ -302,7 +304,7 @@ Para cada trabalho, o worker:
 
 ```powershell
 docker build -t watch-mcp:v2 .
-docker compose -p watch-mcp up -d          # watch-whisper (inalterado) + watch-worker
+docker compose -p watch-mcp up -d          # watch-whisper (v1, inalterado) + watch-whisper-v2 + watch-worker
 ```
 
 A entrada `watch-v2` do `claude_desktop_config.json` (gerada por `entry_v2()` em `tests/e2e/desktop_entry.py`) usa os mesmos limites de container da v1 e monta também `watch-mcp-jobs` em `/jobs` e `D:/Inbox` em `/inbox` (somente leitura). Para usar outra pasta, defina `WATCH_INBOX_DIR` antes do `docker compose up` e ajuste o `--mount` da entrada.
@@ -339,7 +341,34 @@ O vídeo e o áudio são apagados assim que deixam de ser necessários. Trabalho
 
 ### Benchmark pt-BR
 
-_Resultados em andamento; a tabela completa e a decisão ficam na seção "v2" do NOTES-mcp.md._
+Todas as transcrições usam `language="pt"`. O áudio é sempre brasileiro:
+- **TTS:** 20 frases com números, datas, valores em reais, nomes, gírias, TI e agro, em 5 vozes brasileiras (Piper e Kokoro).
+- **Fala real:** um reel narrado, um episódio do Nerdologia com legenda oficial e 3 min de conversa espontânea do Podpah.
+
+WER normalizado (números por extenso dos dois lados), tempo nesta CPU (Xeon E5-2680 v4, 8 CPUs):
+
+| Modelo | WER TTS (com termos) | WER fala real (legenda oficial / ref. aproximada) | s por min de áudio |
+|---|---|---|---|
+| **large-v3-turbo** (deepdml, MIT) | **2,7%** | 11,3% / **9,2%** | 33 |
+| medium (Systran, MIT) | 4,9% | **9,8%** / 13,3% | 34 |
+| **small** (Systran, MIT) | 9,5% | 7,6% / 18,3% | **12** |
+| distil-large-v3 pt-BR (freds0, MIT; em pedaços de 30 s) | 8,5% | 19,7% / 14,6% | 23 |
+| medium pt (pierreguillou, Apache-2.0) | 4,9% | 7,5% / 48,9% | 29 |
+
+Decisão do `quality="auto"`:
+- **Curtos e reels:** `small`, o mais rápido com WER aceitável (7% no reel).
+- **Trabalhos longos:** `large-v3-turbo`, o mais preciso em pt-BR no geral, a ~0,5× o tempo real.
+- **Prompt brasileiro:** sozinho não melhorou de forma consistente; com `terms`, nomes e jargões melhoraram. Por isso ele só é enviado quando há `terms`.
+
+A tabela completa (3 modos de prompt, números, nomes e termos perdidos, RAM) está em [tests/bench/RESULTS.md](tests/bench/RESULTS.md); método, referências e licenças, na seção "v2" do [NOTES-mcp.md](NOTES-mcp.md). Para reproduzir:
+
+```powershell
+.venv\Scripts\python tests\bench\fetch_models.py <pasta>      # modelos (revisões fixas), no host
+#   instalar no volume watch-mcp-models: tests/bench/install_models.py num container descartável (ver NOTES)
+.venv\Scripts\python tests\bench\fetch_real.py                # clipes reais
+#   run_bench.py tts | refs | run <modelos> | run-pieces 30 <modelos>, num container na watch-mcp-net
+.venv\Scripts\python tests\bench\report.py                    # tabela
+```
 
 ### Promover a v2 para substituir a v1
 
