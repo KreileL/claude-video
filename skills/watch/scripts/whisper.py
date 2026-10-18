@@ -46,6 +46,17 @@ MAX_UPLOAD_KEY = "WATCH_WHISPER_MAX_UPLOAD_MB"
 # Deliberately separate from OPENAI_API_KEY: the base URL can point at any host,
 # so forwarding the real OpenAI credential there would leak it to a third party.
 API_KEY_KEY = "WATCH_WHISPER_API_KEY"
+# Full transcription endpoint of a local server (wins over BASE_URL_KEY), for
+# servers whose route isn't <base>/audio/transcriptions or that sit on a
+# compose-network hostname.
+URL_KEY = "WATCH_WHISPER_URL"
+DEFAULT_LOCAL_URL = "http://watch-whisper:8000/v1/audio/transcriptions"
+DEFAULT_LOCAL_MODEL = "Systran/faster-whisper-small"
+TIMEOUT_KEY = "WATCH_WHISPER_TIMEOUT"
+DEFAULT_TIMEOUT = 300.0
+# Stands in for the key on a local server — a placeholder, not a credential, so
+# it must never be sent as an Authorization header.
+LOCAL_NO_KEY = "local"
 
 
 def _dotenv_paths() -> list[Path]:
@@ -96,6 +107,41 @@ def openai_endpoint() -> str:
 def openai_model() -> str:
     """Model id. Local servers use their own ids, not OpenAI's `whisper-1`."""
     return setting(MODEL_KEY) or OPENAI_MODEL
+
+
+def local_endpoint() -> str:
+    """Local server endpoint: explicit URL, else <base>/audio/transcriptions,
+    else the compose-stack default."""
+    url = setting(URL_KEY)
+    if url:
+        return url
+    base = setting(BASE_URL_KEY)
+    if base:
+        return f"{base.rstrip('/')}/audio/transcriptions"
+    return DEFAULT_LOCAL_URL
+
+
+def local_model() -> str:
+    return setting(MODEL_KEY) or DEFAULT_LOCAL_MODEL
+
+
+def request_timeout() -> float:
+    """Per-request timeout in seconds; CPU Whisper on long audio can be slow."""
+    raw = setting(TIMEOUT_KEY)
+    if not raw:
+        return DEFAULT_TIMEOUT
+    try:
+        seconds = float(raw)
+    except ValueError:
+        print(
+            f"[watch] ignoring invalid {TIMEOUT_KEY}={raw!r} (want a number of seconds)",
+            file=sys.stderr,
+        )
+        return DEFAULT_TIMEOUT
+    if seconds <= 0:
+        print(f"[watch] ignoring non-positive {TIMEOUT_KEY}={raw!r}", file=sys.stderr)
+        return DEFAULT_TIMEOUT
+    return seconds
 
 
 def max_upload_bytes() -> int:
@@ -156,12 +202,14 @@ def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, 
     blocking on a credential that carries no meaning. OPENAI_API_KEY is never
     reused here — the base URL can name any host, and the real credential must
     not follow it there. A server that does want auth takes WATCH_WHISPER_API_KEY.
+
+    A local server counts as configured via WATCH_WHISPER_URL or
+    WATCH_WHISPER_BASE_URL. Forcing `preferred="local"` with neither set means
+    "use the default endpoint" (DEFAULT_LOCAL_URL), so it still returns local.
     """
-    local_base = setting(BASE_URL_KEY)
-    if local_base and preferred in (None, "local", "openai"):
-        return "local", setting(API_KEY_KEY) or "local"
-    if preferred == "local" and not local_base:
-        return None, None
+    local_configured = setting(URL_KEY) or setting(BASE_URL_KEY)
+    if preferred == "local" or (local_configured and preferred in (None, "openai")):
+        return "local", setting(API_KEY_KEY) or LOCAL_NO_KEY
 
     candidates = (("GROQ_API_KEY", "groq"), ("OPENAI_API_KEY", "openai"))
     if preferred is not None:
@@ -297,7 +345,7 @@ MAX_429_RETRIES = 2
 RETRY_BASE_DELAY = 2.0
 
 
-def _post_whisper(endpoint: str, api_key: str, model: str, audio_path: Path) -> dict:
+def _post_whisper(endpoint: str, api_key: str | None, model: str, audio_path: Path) -> dict:
     fields = {
         "model": model,
         "response_format": "verbose_json",
@@ -305,7 +353,6 @@ def _post_whisper(endpoint: str, api_key: str, model: str, audio_path: Path) -> 
     }
     body, boundary = _build_multipart(fields, audio_path)
     headers = {
-        "Authorization": f"Bearer {api_key}",
         "Content-Type": f"multipart/form-data; boundary={boundary}",
         # Groq sits behind Cloudflare — the default `Python-urllib/3.x` UA
         # trips WAF rule 1010 (403) before auth even runs. Any non-default
@@ -313,6 +360,10 @@ def _post_whisper(endpoint: str, api_key: str, model: str, audio_path: Path) -> 
         "User-Agent": "watch-skill/1.0 (+claude-code; python-urllib)",
     }
 
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    timeout = request_timeout()
     context = ssl.create_default_context()
     rate_limit_hits = 0
     last_exc: Exception | None = None
@@ -321,7 +372,7 @@ def _post_whisper(endpoint: str, api_key: str, model: str, audio_path: Path) -> 
     for attempt in range(MAX_ATTEMPTS):
         request = Request(endpoint, data=body, headers=headers, method="POST")
         try:
-            with urlopen(request, timeout=300, context=context) as response:
+            with urlopen(request, timeout=timeout, context=context) as response:
                 payload = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = _read_error_body(exc)
@@ -467,9 +518,14 @@ def _transcribe_file(backend: str, api_key: str, audio_path: Path) -> list[dict]
     """Upload one audio file and return its 0-based segments."""
     if backend == "groq":
         response = _post_whisper(GROQ_ENDPOINT, api_key, GROQ_MODEL, audio_path)
-    elif backend in ("openai", "local"):
-        # Identical wire protocol; only the endpoint and model id differ, and
-        # both resolve to the hosted defaults when no local server is set.
+    elif backend == "local":
+        response = _post_whisper(
+            local_endpoint(),
+            None if api_key == LOCAL_NO_KEY else api_key,
+            local_model(),
+            audio_path,
+        )
+    elif backend == "openai":
         response = _post_whisper(openai_endpoint(), api_key, openai_model(), audio_path)
     else:
         raise SystemExit(f"Unknown whisper backend: {backend}")
@@ -495,8 +551,9 @@ def transcribe_video(
         setup_py = Path(__file__).resolve().parent / "setup.py"
         raise SystemExit(
             "No Whisper backend available. Set GROQ_API_KEY (preferred) or OPENAI_API_KEY "
-            f"in the environment or in ~/.config/watch/.env, or set {BASE_URL_KEY} to a "
-            "local OpenAI-compatible server (e.g. http://localhost:8000/v1). "
+            f"in the environment or in ~/.config/watch/.env, or set {URL_KEY} / "
+            f"{BASE_URL_KEY} to a local OpenAI-compatible server "
+            "(e.g. http://localhost:8000/v1/audio/transcriptions). "
             f"Run `python3 {setup_py}` to configure."
         )
 

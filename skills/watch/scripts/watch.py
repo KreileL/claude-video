@@ -77,7 +77,7 @@ def main() -> int:
         default=None,
         help=(
             "Force a specific Whisper backend. Default: prefer a local server "
-            "(WATCH_WHISPER_BASE_URL), then Groq, then OpenAI."
+            "(WATCH_WHISPER_URL / WATCH_WHISPER_BASE_URL), then Groq, then OpenAI."
         ),
     )
     ap.add_argument(

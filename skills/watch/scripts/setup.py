@@ -62,6 +62,7 @@ OPENAI_API_KEY=
 # OPENAI_API_KEY is never sent to this server — the URL can name any host. A
 # server that does want auth reads WATCH_WHISPER_API_KEY instead.
 # WATCH_WHISPER_BASE_URL=http://localhost:8000/v1
+# WATCH_WHISPER_URL=http://localhost:8000/v1/audio/transcriptions   (full endpoint; wins over BASE_URL)
 # WATCH_WHISPER_MODEL=Systran/faster-whisper-large-v3
 # WATCH_WHISPER_MAX_UPLOAD_MB=2048
 # WATCH_WHISPER_API_KEY=
@@ -143,7 +144,7 @@ def _have_api_key() -> tuple[bool, str | None]:
     credential, so gating purely on a key would report a perfectly working
     install as unconfigured and nag the user to add one.
     """
-    if _read_env_key("WATCH_WHISPER_BASE_URL"):
+    if _read_env_key("WATCH_WHISPER_URL") or _read_env_key("WATCH_WHISPER_BASE_URL"):
         return True, "local"
     if _read_env_key("GROQ_API_KEY"):
         return True, "groq"
