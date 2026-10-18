@@ -29,6 +29,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -488,7 +489,18 @@ def check_disk(job: Job) -> None:
         raise JobFailed(f"o cache de trabalhos passou do teto de {MAX_JOBS_BYTES / 1024**3:.0f} GB")
 
 
+def heartbeat(every: float = 15.0) -> None:
+    """Lets the stdio server tell "queued" from "nobody is processing"."""
+    while True:
+        try:
+            jobstore.write_json_atomic(jobstore.JOBS_DIR / jobstore.HEARTBEAT_FILE, {"t": time.time()})
+        except OSError as exc:
+            log(f"heartbeat failed: {type(exc).__name__}")
+        time.sleep(every)
+
+
 def main() -> None:
+    threading.Thread(target=heartbeat, daemon=True).start()
     log(f"started: jobs={jobstore.JOBS_DIR} inbox={inbox.INBOX_DIR} fast={MODEL_FAST} accurate={MODEL_ACCURATE}")
     last_cleanup = 0.0
     while True:

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import re
@@ -38,13 +39,17 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ImageContent, TextContent
 
+import inbox
+import jobstore
 import netguard
+import textsearch
 
 ROOT = Path(__file__).resolve().parent
 SCRIPTS_DIR = ROOT / "skills" / "watch" / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from frames import format_time  # noqa: E402
+import jobview  # noqa: E402  (uses the skill's frames/transcribe)
+from frames import format_time, parse_time  # noqa: E402
 from transcribe import format_transcript  # noqa: E402
 from whisper import local_endpoint  # noqa: E402
 
@@ -92,13 +97,22 @@ INSTAGRAM_LOGIN_MARKERS = (
     "rate-limit",
 )
 
+LANGUAGE_RE = re.compile(r"^[a-z]{2}$")
+MAX_TERMS = 30
+TERM_MAX_LEN = 60
+LIST_JOBS_LIMIT = 20
+
 mcp = MCPServer(
     "watch",
-    version="0.2.0",
+    version="0.3.0",
     instructions=(
-        "Tools to watch a video from a URL (Instagram, TikTok, YouTube, ...): "
-        "watch_video returns metadata, a timestamped transcript and frames; "
-        "transcribe_video returns only the transcript."
+        "Tools to watch videos. Short videos from a URL (Instagram, TikTok, YouTube, ...): "
+        "watch_video(url=...) returns metadata, a timestamped transcript and frames; "
+        "transcribe_video(url) only the transcript. Long videos or local files from the inbox "
+        "(list_inbox): analyze_video(source) starts a background job and returns a job_id at once; "
+        "poll job_status(job_id), then search_transcript(job_id, query) to find moments and "
+        "watch_video(job_id=..., start=..., end=...) for frames and the transcript of a range. "
+        "list_jobs() shows recent jobs."
     ),
 )
 
@@ -385,8 +399,9 @@ async def preflight(
     duration = info.get("duration")
     if duration and float(duration) > MAX_DURATION_SECONDS:
         raise ToolError(
-            f"Vídeo muito longo ({format_time(float(duration))}); o limite é "
-            f"{MAX_DURATION_SECONDS // 60} min. Use start/end para um trecho não ajuda: o download é do vídeo inteiro."
+            f"Vídeo muito longo ({format_time(float(duration))}) para a resposta direta (limite de "
+            f"{MAX_DURATION_SECONDS // 60} min). Use analyze_video(source=<url>) para processá-lo em "
+            "segundo plano, depois job_status, search_transcript e watch_video(job_id=...)."
         )
     return info
 
@@ -623,24 +638,32 @@ def build_text(
 
 @mcp.tool()
 async def watch_video(
-    url: str,
+    url: str | None = None,
     question: str | None = None,
     start: str | None = None,
     end: str | None = None,
     detail: Literal["transcript", "efficient", "balanced"] = "balanced",
     max_frames: int = 24,
+    job_id: str | None = None,
     ctx: Context | None = None,
 ) -> list[TextContent | ImageContent]:
-    """Watch a video from a URL (Instagram reel, TikTok, YouTube, ...).
+    """Watch a video: a short one from a URL, or a range of an analyzed job.
 
-    Returns metadata (title, author, duration, post caption), a transcript with
-    timestamps, and frames as JPEG images in temporal order (t=MM:SS listed in
-    the text). `start`/`end` (SS, MM:SS or HH:MM:SS) focus on a range;
-    `detail`: "transcript" (no frames), "efficient" (keyframes, cheapest) or
-    "balanced" (scene-aware, default). Videos up to 15 minutes.
+    With `url` (Instagram reel, TikTok, YouTube, ... up to 15 minutes): downloads
+    and answers directly. With `job_id` (from analyze_video): instant, from the
+    job's cache, with no new download or transcription.
+
+    Returns metadata, a transcript with timestamps, and frames as JPEG images in
+    temporal order (t=MM:SS listed in the text). `start`/`end` (SS, MM:SS or
+    HH:MM:SS) focus on a range; `detail`: "transcript" (no frames), "efficient"
+    (scene cuts/keyframes, cheapest) or "balanced" (default).
     """
     if not 1 <= max_frames <= MAX_FRAMES_LIMIT:
         raise ToolError(f"max_frames deve estar entre 1 e {MAX_FRAMES_LIMIT}")
+    if (url is None) == (job_id is None):
+        raise ToolError("Informe url (vídeo curto) ou job_id (trabalho de analyze_video), um dos dois.")
+    if job_id is not None:
+        return watch_job(job_id, question=question, start=start, end=end, detail=detail, max_frames=max_frames)
     result, work = await run_watch(url, detail=detail, max_frames=max_frames, start=start, end=end, ctx=ctx)
     try:
         frames, encoded, note = [], [], None
@@ -676,6 +699,190 @@ async def transcribe_video(url: str, ctx: Context | None = None) -> str:
         return scrub(text, result.secrets)
     finally:
         cleanup(work)
+
+
+# ── v2: background jobs ─────────────────────────────────────────────────────
+
+
+def load_job(job_id: str) -> dict:
+    try:
+        return jobstore.load_job(job_id)
+    except jobstore.JobError as exc:
+        raise ToolError(str(exc)) from None
+
+
+def check_terms(terms: list[str] | None) -> list[str]:
+    if terms is None:
+        return []
+    if not isinstance(terms, list) or len(terms) > MAX_TERMS:
+        raise ToolError(f"terms deve ser uma lista de até {MAX_TERMS} termos")
+    out = []
+    for term in terms:
+        if not isinstance(term, str):
+            raise ToolError("terms deve conter apenas textos")
+        term = " ".join(term.split())
+        if len(term) > TERM_MAX_LEN or any(ord(c) < 32 or ord(c) == 127 for c in term):
+            raise ToolError(f"termo inválido (máximo {TERM_MAX_LEN} caracteres, sem caracteres de controle)")
+        if term and term not in out:
+            out.append(term)
+    return out
+
+
+def inbox_source(name: str) -> tuple[str, list]:
+    """Validate an inbox file now (name, no symlink, real media) for a clear,
+    immediate error; the worker checks it again by fd before using it."""
+    try:
+        fd = inbox.open_media(name)
+        try:
+            st = os.fstat(fd)
+            posix = os.name == "posix"
+            inbox.probe(inbox.fd_path(fd) if posix else str(inbox.INBOX_DIR / name),
+                        pass_fds=(fd,) if posix else ())
+        finally:
+            os.close(fd)
+    except inbox.InboxError as exc:
+        raise ToolError(f"Caixa de entrada: {exc}") from None
+    return name, [st.st_size, st.st_mtime_ns]
+
+
+@mcp.tool()
+async def analyze_video(
+    source: str,
+    language: str = "pt",
+    quality: Literal["auto", "fast", "accurate"] = "auto",
+    terms: list[str] | None = None,
+) -> str:
+    """Start a background analysis of a long video or a local file; returns a job_id at once.
+
+    `source`: a URL (same rules as watch_video) or the name of a file in the
+    inbox (see list_inbox; just the name, no folders). Videos up to 4 hours.
+    `language`: Whisper language code, "pt" by default (Brazilian Portuguese
+    context is added to the prompt), or "auto". `quality`: "auto" (fast model for
+    short videos, the most accurate pt-BR model for long ones), "fast" or
+    "accurate". `terms`: optional proper names/jargon that appear in the video,
+    to help the transcription. Then poll job_status(job_id).
+    """
+    source = (source or "").strip()
+    if not source:
+        raise ToolError("Informe source: uma URL ou o nome de um arquivo da caixa de entrada.")
+    language = (language or "pt").strip().lower()
+    if language != "auto" and not LANGUAGE_RE.match(language):
+        raise ToolError('language deve ser um código de 2 letras (ex.: "pt") ou "auto"')
+    if quality not in ("auto", "fast", "accurate"):
+        raise ToolError('quality deve ser "auto", "fast" ou "accurate"')
+    terms = check_terms(terms)
+    if source.lower().startswith(("http://", "https://")):
+        value, fingerprint, kind = check_url(source), [], "url"
+    elif "://" in source:
+        raise ToolError("URL recusada: só http/https")
+    else:
+        (value, fingerprint), kind = await asyncio.to_thread(inbox_source, source), "inbox"
+    key = hashlib.sha256(json.dumps(
+        [kind, value, fingerprint, language, quality, sorted(terms)], ensure_ascii=False,
+    ).encode()).hexdigest()
+    cached = jobstore.find_cached(key)
+    if cached is not None:
+        return ("Este vídeo já foi analisado (ou está em andamento) com os mesmos parâmetros; reaproveitando.\n\n"
+                + jobview.status_text(cached, worker_ok=jobview.worker_alive()))
+    job = jobstore.create_job({
+        "source": {"kind": kind, "value": value},
+        "language": None if language == "auto" else language,
+        "quality": quality,
+        "terms": terms,
+        "cache_key": key,
+    })
+    text = (
+        f"Trabalho criado: job_id = {job['id']}\n\n"
+        "Ele roda em segundo plano (de minutos a horas, conforme a duração). Acompanhe com "
+        "job_status(job_id); quando concluir, use search_transcript e watch_video(job_id=...)."
+    )
+    if not jobview.worker_alive():
+        text += "\n\n**Aviso:** o watch-worker não está respondendo. Rode docker compose -p watch-mcp up -d"
+    return text
+
+
+@mcp.tool()
+async def job_status(job_id: str) -> str:
+    """State, progress (%), current stage and estimated time of a job from analyze_video."""
+    return jobview.status_text(load_job(job_id), worker_ok=jobview.worker_alive())
+
+
+@mcp.tool()
+async def list_jobs() -> str:
+    """Recent analysis jobs: id, state, duration, date and source."""
+    jobs = jobstore.list_jobs()[:LIST_JOBS_LIMIT]
+    if not jobs:
+        return "Nenhum trabalho ainda. Use analyze_video(source) para começar."
+    return "# Trabalhos recentes\n\n" + "\n".join(jobview.job_line(j) for j in jobs)
+
+
+@mcp.tool()
+async def search_transcript(job_id: str, query: str) -> str:
+    """Find where something is said in a job's transcript (accent- and case-insensitive).
+
+    Returns the matching passages with timestamps, to open with watch_video(job_id=..., start, end).
+    """
+    job = load_job(job_id)
+    segments, partial = jobview.load_segments(jobstore.job_path(job["id"]))
+    if not segments:
+        raise ToolError("Ainda não há transcrição para este trabalho; veja job_status(job_id).")
+    try:
+        hits, total = textsearch.search(segments, query)
+    except ValueError:
+        raise ToolError("Informe um texto para buscar.") from None
+    text = jobview.hits_text(job, query, hits, total)
+    if partial:
+        text += "\n\n_Transcrição parcial: o trabalho ainda está em andamento._"
+    return text
+
+
+@mcp.tool()
+async def list_inbox() -> str:
+    """Video/audio files available in the local inbox (D:\\Inbox on the host), to pass to analyze_video."""
+    files = inbox.list_inbox()
+    if not files:
+        return ("A caixa de entrada está vazia (D:\\Inbox no Windows). Extensões aceitas: "
+                + ", ".join(sorted(inbox.ALLOWED_EXTS)))
+    lines = ["# Caixa de entrada", ""]
+    for f in files:
+        lines.append(f"- {f['name']} — {f['size_bytes'] / 1024**2:.1f} MB — {f['modified']}")
+    return "\n".join(lines + ["", 'Use analyze_video(source="<nome do arquivo>").'])
+
+
+def watch_job(job_id: str, *, question: str | None, start: str | None, end: str | None,
+              detail: str, max_frames: int) -> list[TextContent | ImageContent]:
+    """watch_video for a job: index frames + transcript slice, from the cache only."""
+    job = load_job(job_id)
+    job_dir = jobstore.job_path(job["id"])
+    if job.get("state") == "failed":
+        raise ToolError(f"Este trabalho falhou: {job.get('error')}")
+    index = jobstore.read_json(job_dir / "index.json")
+    if index is None:
+        raise ToolError("O trabalho ainda não tem o índice de cenas; veja job_status(job_id).")
+    lo, hi = check_time("start", start), check_time("end", end)
+    lo_s = parse_time(lo) if lo else None
+    hi_s = parse_time(hi) if hi else None
+    if lo_s is not None and hi_s is not None and hi_s <= lo_s:
+        raise ToolError("end deve ser maior que start")
+    segments, partial = jobview.load_segments(job_dir)
+    segments = jobview.in_range(segments, lo_s, hi_s)
+    meta = jobstore.read_json(job_dir / "meta.json") or {}
+    warnings: list[str] = []
+    encoded: list[str] = []
+    times: list[float] | None = None
+    if detail != "transcript":
+        picked = jobview.pick_frames(index.get("frames") or [], job_dir, lo_s, hi_s, detail, max_frames)
+        kept, encoded, note = encode_frames([Frame(path, format_time(t)) for path, t in picked],
+                                            IMAGE_BUDGET_BYTES)
+        seconds = {path: t for path, t in picked}
+        times = [seconds[f.path] for f in kept]
+        if note:
+            warnings.append(note)
+    text = jobview.watch_text(job, meta, segments, partial=partial, start=lo_s, end=hi_s, detail=detail,
+                              question=question, frame_times=times, warnings=warnings)
+    content: list[TextContent | ImageContent] = [TextContent(type="text", text=scrub(text))]
+    content += [ImageContent(type="image", data=data, mime_type="image/jpeg") for data in encoded]
+    return content
 
 
 if __name__ == "__main__":

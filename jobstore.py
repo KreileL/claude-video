@@ -24,6 +24,8 @@ JOBS_DIR = Path(os.environ.get("WATCH_JOBS_DIR", "/jobs"))
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 STATES = ("queued", "running", "done", "failed")
 ORPHAN_AGE = 3600.0
+# Touched by the worker every few seconds; not a job dir, so every scan skips it.
+HEARTBEAT_FILE = ".heartbeat"
 
 
 class JobError(ValueError):
