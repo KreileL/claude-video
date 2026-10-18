@@ -694,3 +694,37 @@ def test_p3_again_after_an_unrecorded_publish_adopts_it(env, monkeypatch):
     assert len(user_folders(vault)) == 1
     assert postproc.run_export(jid, again=True)  # now recorded: a real new version
     assert len(user_folders(vault)) == 2
+
+
+# ── Codex v3 pass 4 ─────────────────────────────────────────────────────────
+
+
+def test_p4_an_exporter_never_sees_a_job_that_cleanup_is_deleting(env, monkeypatch):
+    """Pass 4: rmtree could unlink .export.lock first, letting an exporter create a new
+    lock and read a half-deleted job. The job is now renamed out of the namespace first."""
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    legacy(jobs, jid)
+    real_rmtree = jobstore.shutil.rmtree
+    seen = {}
+
+    def rmtree_with_a_concurrent_export(path, *a, **k):
+        with pytest.raises(jobstore.JobError):
+            postproc.run_export(jid)
+        seen["export_refused"] = True
+        return real_rmtree(path, *a, **k)
+
+    monkeypatch.setattr(jobstore.shutil, "rmtree", rmtree_with_a_concurrent_export)
+    assert jobstore.cleanup(jobs, ttl_seconds=1, max_bytes=0, now=time.time() + 10**7) == [jid]
+    assert seen["export_refused"] and not (jobs / jid).exists()
+    assert user_folders(vault) == []
+
+
+def test_p4_trash_left_by_a_dead_cleanup_is_emptied(env):
+    jobs, _, _ = env
+    left = jobs / jobstore.TRASH_DIR / ("a" * 32 + "-dead")
+    left.mkdir(parents=True)
+    (left / "transcript.json").write_text("{}")
+    jobstore.cleanup(jobs, ttl_seconds=10**9, max_bytes=10**12)
+    assert not left.exists()
+    assert jobstore.list_jobs(jobs) == []  # the trash is never seen as a job

@@ -27,6 +27,7 @@ STATES = ("queued", "running", "done", "failed")
 ORPHAN_AGE = 3600.0
 ARCHIVED = "archived"  # v3: exported to the Holocron; never expires (v2 cleanup also skips it)
 EXPORT_LOCK = ".export.lock"  # v3: held by the exporter, and by cleanup while it removes a job
+TRASH_DIR = ".trash"  # v3: a job is renamed here (atomically, under its lock) before rmtree
 # Touched by the worker every few seconds; not a job dir, so every scan skips it.
 HEARTBEAT_FILE = ".heartbeat"
 
@@ -210,6 +211,35 @@ def _remove(path: str) -> bool:
     return True
 
 
+def _discard(path: str, name: str) -> bool:
+    """Atomically move a job out of the job namespace, then delete it. Called under the
+    job's lock: once renamed, nobody can find (or re-create a lock in) the job, so an
+    rmtree that unlinks .export.lock early can no longer race an exporter."""
+    if os.path.islink(path):
+        return False
+    trash = Path(path).parent / TRASH_DIR
+    try:
+        if is_link(trash):
+            return False
+        trash.mkdir(mode=0o700, exist_ok=True)
+        target = trash / f"{name}-{secrets.token_hex(4)}"
+        os.rename(path, target)
+    except OSError:
+        return False
+    shutil.rmtree(target, ignore_errors=True)
+    return True
+
+
+def _empty_trash(root: Path | None) -> None:
+    """Leftovers of a cleanup that died between the rename and the rmtree."""
+    trash = _root(root) / TRASH_DIR
+    if is_link(trash) or not trash.is_dir():
+        return
+    for entry in os.scandir(trash):
+        if not entry.is_symlink() and entry.is_dir(follow_symlinks=False):
+            shutil.rmtree(entry.path, ignore_errors=True)
+
+
 def _evictable(job: dict | None) -> bool:
     # v3: a done job still waiting for its Holocron note is kept until it is archived.
     return (job is not None and job.get("state") in ("done", "failed")
@@ -258,11 +288,11 @@ def _remove_claimed(path: str, name: str) -> bool:
     if not _evictable(job if job is not None and job.get("id") == name else None):
         release_job(fd)
         return False
-    if os.name == "nt":  # Windows cannot delete an open file (test runs only)
+    if os.name == "nt":  # Windows cannot rename a dir with an open file (test runs only)
         release_job(fd)
-        return _remove(path)
+        return _discard(path, name)
     try:
-        return _remove(path)
+        return _discard(path, name)
     finally:
         release_job(fd)
 
@@ -274,6 +304,10 @@ def cleanup(root: Path | None = None, *, ttl_seconds: float, max_bytes: int,
     Never touches queued, running or archived jobs.
     """
     now = time.time() if now is None else now
+    try:
+        _empty_trash(root)
+    except OSError:
+        pass
     removed: list[str] = []
     finished: list[tuple[float, str, str]] = []  # (updated, id, path)
     sizes: dict[str, int] = {}

@@ -67,6 +67,15 @@ def _lock(job_dir: Path) -> int:
         raise Busy("trava do trabalho indisponível") from None
     if fd is None:
         raise Busy("exportação já em andamento para este trabalho")
+    # The lock must still be the job's own file: a cleanup may have moved the job to
+    # the trash between our open() and our flock().
+    try:
+        same = os.path.samestat(os.fstat(fd), os.stat(job_dir / LOCK_NAME, follow_symlinks=False))
+    except OSError:
+        same = False
+    if not same:
+        jobstore.release_job(fd)
+        raise jobstore.JobError("trabalho não encontrado")
     return fd
 
 
