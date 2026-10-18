@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir -r /app/requirements-mcp.txt
 
 COPY skills/watch /app/skills/watch
 COPY mcp_server.py netguard.py inbox.py jobstore.py jobview.py textsearch.py chunking.py worker.py \
-     entrada.py resumo.py postproc.py telegram_bot.py /app/
+     entrada.py resumo.py postproc.py telegram_bot.py urlclean.py /app/
 
 # A fresh named volume mounted at /jobs copies this ownership (uid 10001).
 RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin watch \
