@@ -52,6 +52,20 @@ ENV_TEMPLATE = """# /watch API configuration
 GROQ_API_KEY=
 OPENAI_API_KEY=
 
+# Local OpenAI-compatible server (speaches, faster-whisper-server, LM Studio,
+# whisper.cpp's whisper-server, ...). Set the /v1 root and /watch talks to it
+# instead of a hosted API — no key needed, and the audio never leaves the
+# machine. A configured server wins over a hosted key; `--whisper groq`
+# overrides. WATCH_WHISPER_MODEL is the server's own model id, not OpenAI's.
+# The upload cap exists only because the hosted APIs enforce 25 MB; raise it
+# locally to avoid needless chunking.
+# OPENAI_API_KEY is never sent to this server — the URL can name any host. A
+# server that does want auth reads WATCH_WHISPER_API_KEY instead.
+# WATCH_WHISPER_BASE_URL=http://localhost:8000/v1
+# WATCH_WHISPER_MODEL=Systran/faster-whisper-large-v3
+# WATCH_WHISPER_MAX_UPLOAD_MB=2048
+# WATCH_WHISPER_API_KEY=
+
 # Default watch behavior (the /watch first-run wizard sets this for you).
 # Allowed values: transcript | efficient | balanced | token-burner
 # Keep the value on its own line with no trailing comment.
@@ -72,7 +86,16 @@ _PERM_WARNED: set[str] = set()
 
 def _check_file_permissions(path: Path) -> None:
     """Warn to stderr (once per path per process) if a secrets file is
-    world/group readable."""
+    world/group readable.
+
+    POSIX only. Windows secures files with ACLs, and Python there synthesises
+    ``st_mode`` from the read-only attribute alone — a file locked down with
+    ``icacls`` still reports 0o666, so this check would fire on every run and
+    tell the user to run ``chmod``, which does nothing on Windows. An
+    unactionable warning on every invocation is worse than no warning.
+    """
+    if os.name == "nt":
+        return
     key = str(path)
     if key in _PERM_WARNED:
         return
@@ -114,6 +137,14 @@ def _read_env_key(name: str) -> str | None:
 
 
 def _have_api_key() -> tuple[bool, str | None]:
+    """Whether a transcription backend is configured, and which one.
+
+    A local OpenAI-compatible server counts and is checked first: it needs no
+    credential, so gating purely on a key would report a perfectly working
+    install as unconfigured and nag the user to add one.
+    """
+    if _read_env_key("WATCH_WHISPER_BASE_URL"):
+        return True, "local"
     if _read_env_key("GROQ_API_KEY"):
         return True, "groq"
     if _read_env_key("OPENAI_API_KEY"):

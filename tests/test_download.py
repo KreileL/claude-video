@@ -43,22 +43,36 @@ def _sub_langs(argv: list[str]) -> str:
     return argv[idx + 1]
 
 
-def _assert_english_only(langs: str) -> None:
-    tokens = langs.split(",")
+def _assert_original_and_english(langs: str) -> None:
+    """Guard the subtitle selection: the original-language track first, English
+    as the fallback, and never every language on the platform.
+
+    The breadth guard is the point — `all` (or a bare `.*`) pulls down a
+    subtitle file per language, dozens on a popular video. The original-language
+    requirement is what keeps a non-English video from being read through
+    YouTube's machine translation when the real audio is right there.
+    """
+    tokens = [t.strip() for t in langs.split(",")]
     assert "all" not in tokens, f"sub-langs must not request all languages, got {langs!r}"
-    assert all(t.startswith("en") for t in tokens), f"sub-langs must be English-only, got {langs!r}"
+    assert ".*" not in tokens, f"a bare '.*' is every language, got {langs!r}"
+    assert any(t.endswith("-orig") for t in tokens), (
+        f"sub-langs must request the original-language track, got {langs!r}"
+    )
+    assert any(t.startswith("en") for t in tokens), (
+        f"sub-langs must keep English as a fallback, got {langs!r}"
+    )
 
 
-def test_fetch_captions_requests_english_only(monkeypatch, tmp_path):
+def test_fetch_captions_requests_original_and_english(monkeypatch, tmp_path):
     calls = _capture_argv(monkeypatch)
     download.fetch_captions(URL, tmp_path / "download")
-    _assert_english_only(_sub_langs(calls[0]))
+    _assert_original_and_english(_sub_langs(calls[0]))
 
 
-def test_download_url_requests_english_only(monkeypatch, tmp_path):
+def test_download_url_requests_original_and_english(monkeypatch, tmp_path):
     calls = _capture_argv(monkeypatch)
     # _pick_video returns None with no real file, which raises SystemExit after
     # the yt-dlp argv is already built — that's all we need to inspect.
     with pytest.raises(SystemExit):
         download.download_url(URL, tmp_path / "download")
-    _assert_english_only(_sub_langs(calls[0]))
+    _assert_original_and_english(_sub_langs(calls[0]))

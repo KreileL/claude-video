@@ -7,6 +7,7 @@ then Reads each frame path to see the video.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -20,6 +21,12 @@ from download import download, fetch_captions, is_url  # noqa: E402
 from frames import MAX_FPS, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
+
+
+# Above this many seconds between frames, the gaps matter more than the frames.
+# The designed density is ~6s/frame (a 100-frame cap across a 10-minute clip),
+# so this threshold sits well past "merely coarse".
+SPARSE_SECONDS_PER_FRAME = 15.0
 
 
 def main() -> int:
@@ -55,10 +62,23 @@ def main() -> int:
         help="Disable Whisper fallback. Report frames-only if no captions available.",
     )
     ap.add_argument(
+        "--force-whisper",
+        action="store_true",
+        help=(
+            "Transcribe with Whisper even when native captions exist. Worth it when "
+            "the platform's auto-captions are poor (no punctuation, mangled proper "
+            "nouns, rolling duplicates) and Whisper runs locally, so the only cost "
+            "is CPU time. Falls back to the captions if Whisper fails."
+        ),
+    )
+    ap.add_argument(
         "--whisper",
-        choices=["groq", "openai"],
+        choices=["groq", "openai", "local"],
         default=None,
-        help="Force a specific Whisper backend. Default: prefer Groq, fall back to OpenAI.",
+        help=(
+            "Force a specific Whisper backend. Default: prefer a local server "
+            "(WATCH_WHISPER_BASE_URL), then Groq, then OpenAI."
+        ),
     )
     ap.add_argument(
         "--no-dedup",
@@ -67,6 +87,9 @@ def main() -> int:
              "frames (static screen recordings, held slides) instead of collapsing them.",
     )
     args = ap.parse_args()
+
+    if args.force_whisper and args.no_whisper:
+        raise SystemExit("--force-whisper and --no-whisper are mutually exclusive")
 
     config = get_config()
     detail = args.detail or str(config["detail"])
@@ -97,7 +120,9 @@ def main() -> int:
     if url_source:
         print("[watch] checking metadata/captions via yt-dlp…", file=sys.stderr)
         dl = fetch_captions(args.source, work / "download")
-        if dl.get("subtitle_path"):
+        # Captions are still fetched under --force-whisper: they cost nothing
+        # extra here and stand as the fallback if Whisper cannot deliver.
+        if dl.get("subtitle_path") and not args.force_whisper:
             try:
                 transcript_segments = parse_vtt(dl["subtitle_path"])
                 transcript_text = format_transcript(transcript_segments)
@@ -105,6 +130,11 @@ def main() -> int:
             except Exception as exc:
                 print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
                 transcript_segments = []
+        elif dl.get("subtitle_path"):
+            print(
+                "[watch] --force-whisper: native captions found but set aside",
+                file=sys.stderr,
+            )
 
     # --timestamps needs the video for frame grabs, so it overrides the
     # transcript-mode download skip (and forces a full, not audio-only, fetch).
@@ -227,7 +257,7 @@ def main() -> int:
     if cue_frames:
         frames = merge_frames(frames, cue_frames)
 
-    if not transcript_segments and dl.get("subtitle_path"):
+    if not transcript_segments and dl.get("subtitle_path") and not args.force_whisper:
         try:
             all_segments = parse_vtt(dl["subtitle_path"])
             transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
@@ -253,9 +283,9 @@ def main() -> int:
                 print(f"[watch] whisper fallback failed: {exc}", file=sys.stderr)
         else:
             hint = (
-                f"--whisper {args.whisper} was set but the matching API key is missing"
+                f"--whisper {args.whisper} was set but it is not configured"
                 if args.whisper else
-                "no subtitles and no Whisper API key found"
+                "no subtitles, and no Whisper API key or local server configured"
             )
             setup_py = SCRIPT_DIR / "setup.py"
             print(
@@ -264,6 +294,43 @@ def main() -> int:
             )
     elif not transcript_segments and video_path and not meta.get("has_audio"):
         print("[watch] no audio stream found — proceeding without transcription", file=sys.stderr)
+
+    # --force-whisper set the captions aside on purpose. If Whisper then failed
+    # (backend down, no backend configured, audio unusable), captions are still
+    # a far better outcome than reporting no transcript at all.
+    if args.force_whisper and not transcript_segments and dl.get("subtitle_path"):
+        try:
+            all_segments = parse_vtt(dl["subtitle_path"])
+            transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
+            transcript_text = format_transcript(transcript_segments)
+            transcript_source = "captions (whisper unavailable)"
+            print("[watch] falling back to native captions", file=sys.stderr)
+        except Exception as exc:
+            print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
+
+    # Persist the transcript beside the frames. Whisper output is otherwise
+    # ephemeral — it exists only in this report — and re-deriving it costs a
+    # full transcription pass. The captions path leaves only yt-dlp's raw .vtt,
+    # which is neither range-filtered nor in our segment shape.
+    transcript_file: Path | None = None
+    if transcript_segments:
+        transcript_file = work / "transcript.json"
+        try:
+            transcript_file.write_text(
+                json.dumps(
+                    {
+                        "source": transcript_source,
+                        "range": {"start": effective_start, "end": effective_end} if focused else None,
+                        "segments": transcript_segments,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            print(f"[watch] could not write transcript.json: {exc}", file=sys.stderr)
+            transcript_file = None
 
     info = dl.get("info") or {}
 
@@ -323,15 +390,26 @@ def main() -> int:
             "This may use a large number of image tokens."
         )
 
-    if not focused and full_duration > 600 and detail not in ("transcript", "token-burner"):
-        mins = int(full_duration // 60)
-        print()
-        print(
-            f"> **Warning:** This is a {mins}-minute video. Frame coverage is sparse at this length "
-            f"under `{detail}` detail — its cap spreads thin across the full clip. For better results, "
-            "re-run with `--start HH:MM:SS --end HH:MM:SS` to zoom into a section, or use "
-            "`--detail token-burner` to keep every scene-change frame across the whole video."
-        )
+    # Warn on the coverage actually achieved, not on the detail mode. The old
+    # check keyed off duration and exempted token-burner, on the theory that an
+    # uncapped mode cannot be sparse. It can: uncapped only removes the ceiling,
+    # it does not make the selector find more. A talking-head video yields a
+    # handful of scene cuts however long it runs, so the one mode that stayed
+    # silent was the one that had gone blind — 17 frames across 11 minutes, with
+    # multi-minute gaps, and no warning at all.
+    if not focused and detail != "transcript" and frames and full_duration > 0:
+        seconds_per_frame = full_duration / len(frames)
+        if seconds_per_frame > SPARSE_SECONDS_PER_FRAME:
+            mins = int(full_duration // 60)
+            print()
+            print(
+                f"> **Warning:** {len(frames)} frames across {mins} minutes — roughly one every "
+                f"{seconds_per_frame:.0f}s, so stretches of this video were never sampled. "
+                "Treat any visual claim as unverified between frames. To fix, re-run with "
+                "`--start HH:MM:SS --end HH:MM:SS` to zoom into the part you care about. "
+                "`--detail token-burner` only helps when the video has more scene changes than "
+                "the cap allowed — it will not add frames to footage that simply holds one shot."
+            )
 
     print()
     print("## Frames")
@@ -361,6 +439,8 @@ def main() -> int:
             print(f"_Source: {label}. Filtered to {format_time(effective_start)} → {format_time(effective_end)}:_")
         else:
             print(f"_Source: {label}._")
+        if transcript_file:
+            print(f"_Saved to: `{transcript_file}`_")
         print()
         print("```")
         print(transcript_text)
