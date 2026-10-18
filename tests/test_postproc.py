@@ -728,3 +728,11 @@ def test_p4_trash_left_by_a_dead_cleanup_is_emptied(env):
     jobstore.cleanup(jobs, ttl_seconds=10**9, max_bytes=10**12)
     assert not left.exists()
     assert jobstore.list_jobs(jobs) == []  # the trash is never seen as a job
+
+
+def test_p5_trash_leftovers_count_against_the_cap(env):
+    jobs, _, _ = env
+    left = jobs / jobstore.TRASH_DIR / ("b" * 32 + "-left")
+    left.mkdir(parents=True)
+    (left / "audio.mp3").write_bytes(b"x" * 5000)
+    assert worker.cache_used(jobs) == 5000

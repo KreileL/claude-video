@@ -227,8 +227,10 @@ class Job:
 
 def cache_used(root: Path | None) -> int:
     """Bytes of the working cache; archived jobs (v3) are kept apart from the cap."""
-    return sum(jobstore.dir_size(jobstore.job_path(j["id"], root)) for j in jobstore.list_jobs(root)
+    jobs = sum(jobstore.dir_size(jobstore.job_path(j["id"], root)) for j in jobstore.list_jobs(root)
                if j.get("state") != jobstore.ARCHIVED)
+    trash = (root or jobstore.JOBS_DIR) / jobstore.TRASH_DIR  # leftovers of a failed rmtree still use disk
+    return jobs + (jobstore.dir_size(trash) if trash.is_dir() and not jobstore.is_link(trash) else 0)
 
 
 def ensure_room(job: Job, need: int) -> int:
