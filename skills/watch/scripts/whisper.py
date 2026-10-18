@@ -474,13 +474,19 @@ def shift_segments(segments: list[dict], offset_seconds: float) -> list[dict]:
     ]
 
 
+def _valid_segment(seg) -> bool:
+    # Each segment carries its text as a string ("" is legitimate silence); anything
+    # else (null, missing, an error object) is a broken answer, not silence.
+    return isinstance(seg, dict) and isinstance(seg.get("text"), str) and "error" not in seg
+
+
 def require_transcription(data) -> dict:
     """A body that is really a transcription: an error object (even with HTTP 200)
     must not read as "no speech" (MCP v3: silence is reported, errors fail)."""
     valid = (isinstance(data, dict) and "error" not in data and ("segments" in data or "text" in data)
              and ("text" not in data or isinstance(data["text"], str))
              and ("segments" not in data or (isinstance(data["segments"], list)
-                                            and all(isinstance(s, dict) for s in data["segments"]))))
+                                            and all(_valid_segment(s) for s in data["segments"]))))
     if not valid:
         raise SystemExit("Whisper returned an invalid response (no transcription in it)")
     return data

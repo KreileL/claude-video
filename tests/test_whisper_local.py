@@ -267,3 +267,18 @@ def test_p7_error_detail_is_one_line():
     exc = urllib.error.HTTPError("http://x", 400, "Bad Request", {}, io.BytesIO(body))
     detail = whisper._read_error_body(exc)
     assert "\n" not in detail and "backend failed" in detail
+
+
+# ── Codex v3 pass 8 ─────────────────────────────────────────────────────────
+
+
+def test_p8_segments_without_string_text_are_not_silence():
+    import pytest as _pytest
+    for bad in ({"segments": [{"text": None, "error": "model unavailable"}]}, {"segments": [{}]},
+                {"segments": [{"text": False}]}, {"segments": [{"text": 0}]}, {"segments": [{"text": []}]},
+                {"segments": [{"text": "", "error": "x"}]}):
+        with _pytest.raises(SystemExit, match="invalid response"):
+            whisper.require_transcription(bad)
+    for silence in ({"segments": [{"text": ""}]}, {"segments": [{"text": "  ", "start": 0, "end": 1}]},
+                    {"text": "", "segments": []}):
+        assert whisper.require_transcription(silence) is silence
