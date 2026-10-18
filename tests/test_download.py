@@ -91,3 +91,102 @@ def test_pick_subtitle_without_language_keeps_first_orig(tmp_path):
     for name in ("video.en-US-orig.vtt", "video.pt-orig.vtt"):
         (tmp_path / name).write_text("WEBVTT\n", encoding="utf-8")
     assert download._pick_subtitle(tmp_path).name == "video.en-US-orig.vtt"
+
+
+# --- operator-set env hooks (WATCH_YTDLP_ARGS / WATCH_YTDLP_TIMEOUT) ---------
+
+
+def _capture_run(monkeypatch: pytest.MonkeyPatch, raises: Exception | None = None):
+    """Like _capture_argv but records (argv, kwargs) and can raise from run()."""
+    calls: list[tuple[list[str], dict]] = []
+
+    class _Result:
+        returncode = 0
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append((list(cmd), kwargs))
+        if raises is not None:
+            raise raises
+        return _Result()
+
+    monkeypatch.setattr(download.subprocess, "run", fake_run)
+    return calls
+
+
+def _run_both(tmp_path):
+    """Run fetch_captions and download_url; return nothing (stub records)."""
+    download.fetch_captions(URL, tmp_path / "a")
+    with pytest.raises(SystemExit):
+        download.download_url(URL, tmp_path / "b")
+
+
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch):
+    monkeypatch.delenv("WATCH_YTDLP_ARGS", raising=False)
+    monkeypatch.delenv("WATCH_YTDLP_TIMEOUT", raising=False)
+
+
+def test_extra_args_injected_after_ytdlp_before_end_of_options(monkeypatch, tmp_path):
+    calls = _capture_run(monkeypatch)
+    monkeypatch.setenv("WATCH_YTDLP_ARGS", '["--proxy", "http://127.0.0.1:8899", "--max-filesize", "500M"]')
+    _run_both(tmp_path)
+    assert len(calls) == 2
+    for argv, _ in calls:
+        assert argv[:5] == ["yt-dlp", "--proxy", "http://127.0.0.1:8899", "--max-filesize", "500M"]
+        assert argv.index("--proxy") < argv.index("--")
+        assert argv[-2:] == ["--", URL]
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_unset_or_blank_args_leave_argv_unchanged(monkeypatch, tmp_path, value):
+    baseline = _capture_run(monkeypatch)
+    _run_both(tmp_path)
+    expected = [argv for argv, _ in baseline]
+    if value is not None:
+        monkeypatch.setenv("WATCH_YTDLP_ARGS", value)
+    again = _capture_run(monkeypatch)
+    _run_both(tmp_path)
+    assert [argv for argv, _ in again] == expected
+
+
+@pytest.mark.parametrize("value", ["--proxy secret-cookies.txt", '{"a": "secret-cookies.txt"}', '["--proxy", 5, "secret-cookies.txt"]'])
+def test_invalid_extra_args_exit_with_fixed_message(monkeypatch, tmp_path, value):
+    _capture_run(monkeypatch)
+    monkeypatch.setenv("WATCH_YTDLP_ARGS", value)
+    for fn in (download.fetch_captions, download.download_url):
+        with pytest.raises(SystemExit) as exc:
+            fn(URL, tmp_path / "x")
+        assert str(exc.value) == "WATCH_YTDLP_ARGS must be a JSON array of strings"
+        assert "secret-cookies" not in str(exc.value)
+
+
+def test_timeout_passed_through(monkeypatch, tmp_path):
+    calls = _capture_run(monkeypatch)
+    monkeypatch.setenv("WATCH_YTDLP_TIMEOUT", "120")
+    _run_both(tmp_path)
+    assert [kw.get("timeout") for _, kw in calls] == [120.0, 120.0]
+
+
+@pytest.mark.parametrize("value", [None, "abc", "0", "-5"])
+def test_timeout_absent_or_invalid_is_none(monkeypatch, tmp_path, value):
+    calls = _capture_run(monkeypatch)
+    if value is not None:
+        monkeypatch.setenv("WATCH_YTDLP_TIMEOUT", value)
+    _run_both(tmp_path)
+    assert [kw.get("timeout") for _, kw in calls] == [None, None]
+
+
+def test_invalid_timeout_warns_on_stderr(monkeypatch, tmp_path, capsys):
+    _capture_run(monkeypatch)
+    monkeypatch.setenv("WATCH_YTDLP_TIMEOUT", "abc")
+    download.fetch_captions(URL, tmp_path / "a")
+    assert "WATCH_YTDLP_TIMEOUT" in capsys.readouterr().err
+
+
+def test_timeout_expired_becomes_systemexit(monkeypatch, tmp_path):
+    _capture_run(monkeypatch, raises=subprocess.TimeoutExpired("yt-dlp", 5))
+    monkeypatch.setenv("WATCH_YTDLP_TIMEOUT", "5")
+    for fn in (download.fetch_captions, download.download_url):
+        with pytest.raises(SystemExit) as exc:
+            fn(URL, tmp_path / "x")
+        assert "timed out after 5s" in str(exc.value)

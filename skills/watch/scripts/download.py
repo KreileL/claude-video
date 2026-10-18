@@ -7,6 +7,7 @@ transcribe.py can parse them without needing Whisper.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -103,6 +104,49 @@ def _pick_video(out_dir: Path) -> Path | None:
     return None
 
 
+# Operator-set hooks for the MCP server (mcp_server.py), which runs watch.py in
+# a locked-down container: WATCH_YTDLP_ARGS injects yt-dlp options (egress
+# proxy, cookies file, size/duration limits) and WATCH_YTDLP_TIMEOUT bounds the
+# run. They come from the container environment, never from user input.
+def _extra_args() -> list[str]:
+    raw = os.environ.get("WATCH_YTDLP_ARGS", "").strip()
+    if not raw:
+        return []
+    try:
+        args = json.loads(raw)
+    except ValueError:
+        args = None
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        # Don't echo the value: it may contain a path the operator keeps private.
+        raise SystemExit("WATCH_YTDLP_ARGS must be a JSON array of strings")
+    return args
+
+
+def _timeout() -> float | None:
+    raw = os.environ.get("WATCH_YTDLP_TIMEOUT", "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+        if not value > 0 or value == float("inf"):
+            raise ValueError(raw)
+    except ValueError:
+        print(
+            "[watch] warning: WATCH_YTDLP_TIMEOUT must be a positive number of seconds, ignoring",
+            file=sys.stderr,
+        )
+        return None
+    return value
+
+
+def _run_ytdlp(cmd: list[str]) -> subprocess.CompletedProcess:
+    timeout = _timeout()
+    try:
+        return subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise SystemExit(f"yt-dlp timed out after {timeout:g}s")
+
+
 def fetch_captions(url: str, out_dir: Path) -> dict:
     """Fetch metadata and best available VTT captions without downloading video."""
     if shutil.which("yt-dlp") is None:
@@ -112,6 +156,7 @@ def fetch_captions(url: str, out_dir: Path) -> dict:
     output_template = str(out_dir / "video.%(ext)s")
     cmd = [
         "yt-dlp",
+        *_extra_args(),
         "--skip-download",
         "--write-info-json",
         "--write-subs",
@@ -125,7 +170,7 @@ def fetch_captions(url: str, out_dir: Path) -> dict:
         "--",
         url,
     ]
-    subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
+    _run_ytdlp(cmd)
     subtitle = _pick_subtitle(out_dir)
     info = _read_info(out_dir / "video.info.json", url)
     return {
@@ -167,6 +212,7 @@ def download_url(
     fmt = "ba/bestaudio" if audio_only else "bv*[height<=720]+ba/b[height<=720]/bv+ba/b"
     cmd = [
         "yt-dlp",
+        *_extra_args(),
         "-N", "8",
         "-f", fmt,
         "--merge-output-format", "mp4",
@@ -185,7 +231,7 @@ def download_url(
 
     # yt-dlp may exit non-zero if a subtitle variant fails (e.g. 429) even when
     # the video itself downloaded fine. Treat "video file present" as success.
-    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
+    result = _run_ytdlp(cmd)
     video = _pick_video(out_dir)
     if video is None:
         raise SystemExit(
