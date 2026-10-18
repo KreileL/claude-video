@@ -86,3 +86,7 @@ def test_wer_details():
 def test_missing_terms():
     hyp = "O Doutor Silva chegou às 14h30 em São Paulo"
     assert metrics.missing_terms(["Silva", "são paulo", "Rio", "14h30", "Sil"], hyp) == ["Rio", "Sil"]
+
+
+def test_scoreline_x_reads_as_a():
+    assert metrics.normalize_ptbr("venceu por 2x1") == metrics.normalize_ptbr("venceu por dois a um")

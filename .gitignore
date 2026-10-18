@@ -17,3 +17,4 @@ htmlcov/
 
 # Codex review worktrees and output
 .codex/
+tests/bench/data/

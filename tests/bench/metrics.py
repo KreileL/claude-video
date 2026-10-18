@@ -126,6 +126,7 @@ def normalize_ptbr(text: str) -> str:
     t = re.sub(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)", _time, t)
     t = re.sub(rf"({_NUM})(?:,(\d+))?\s*%", _percent, t)
     t = re.sub(r"(\d+)\s*([ºª])", _ordinal, t)
+    t = re.sub(r"(?<!\d)(\d{1,2})\s*[x×]\s*(\d{1,2})(?!\d)", r"\1 a \2", t)  # scorelines
     t = re.sub(rf"({_NUM}),(\d+)", lambda m: _decimal_words(m.group(1), m.group(2)), t)
     t = re.sub(_NUM, lambda m: _words(m.group(0)), t)
     t = re.sub(r"\bquatorze\b", "catorze", t)
