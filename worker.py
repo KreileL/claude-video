@@ -63,6 +63,8 @@ FRAME_LONG_SIDE = mcp_server.FRAME_LONG_SIDE
 MAX_INDEX_FRAMES = 2500
 SCENE_THRESHOLD = 0.3
 WHISPER_RETRIES = (30, 60, 120)  # seconds to wait before each retry of a chunk
+MAX_ATTEMPTS = 3  # a job that keeps killing the worker is failed, not resumed forever
+SOURCE_NAME_RE = re.compile(r"^source\.[a-z0-9]{2,5}$")
 SHOWINFO_TS_RE = re.compile(r"pts_time:([0-9.]+)")
 DOWNLOAD_FORMAT = "bv*[height<=720]+ba/b[height<=720]/bv+ba/b"
 
@@ -190,6 +192,10 @@ class Source:
     def input(self) -> list[str]:
         return [*inbox.input_args(self.info["demuxer"]), "-i", self.path]
 
+    def limit(self) -> str:
+        """Output duration cap: the probed (already limit-checked) duration, plus slack."""
+        return f"{self.info['duration'] + 5:.3f}"
+
     def close(self) -> None:
         try:
             os.close(self.fd)
@@ -227,7 +233,10 @@ def download(job: Job, url: str) -> Path:
     work.mkdir(exist_ok=True)
     done = work / "download.done"
     if done.exists():  # finished before a restart: reuse it
-        return work / done.read_text(encoding="utf-8").strip()
+        name = done.read_text(encoding="utf-8").strip()
+        if not SOURCE_NAME_RE.match(name):
+            raise JobFailed("estado de download inválido no cache")
+        return work / name
     for stale in work.glob("source.*"):  # an interrupted download starts over
         stale.unlink()
     tmp = Path(tempfile.mkdtemp(prefix="watch-worker-"))
@@ -325,7 +334,7 @@ def extract_audio(job: Job, src: Source) -> None:
         return
     job.update(stage="extraindo áudio", progress=15.0)
     tmp = job.work / "audio.tmp.mp3"
-    got = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *src.input(),
+    got = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *src.input(), "-t", src.limit(),
                "-vn", "-acodec", "libmp3lame", "-ar", "16000", "-ac", "1", "-b:a", "64k", str(tmp)],
               timeout=job.remaining(), pass_fds=src.fds)
     if got.returncode != 0 or not tmp.exists():
@@ -352,7 +361,7 @@ def build_index(job: Job, src: Source) -> None:
     job.update(stage="indexando cenas", progress=20.0)
     grid = grid_interval(src.info["duration"])
     select = f"select='eq(n\\,0)+gt(scene\\,{SCENE_THRESHOLD})+gte(t-prev_selected_t\\,{grid})'"
-    got = run(["ffmpeg", "-hide_banner", "-loglevel", "info", "-y", *src.input(),
+    got = run(["ffmpeg", "-hide_banner", "-loglevel", "info", "-y", *src.input(), "-t", src.limit(),
                "-an", "-sn", "-vf", f"{scale_filter()},{select},showinfo", "-fps_mode", "vfr",
                "-frames:v", str(MAX_INDEX_FRAMES * 3), "-q:v", "5", str(frames / "f_%05d.jpg")],
               timeout=job.remaining(), pass_fds=src.fds)
@@ -448,12 +457,15 @@ def transcribe_chunk(job: Job, piece: Path, *, model: str, language: str | None,
 
 def process(data: dict, *, root: Path | None = None, inbox_root: Path | None = None) -> None:
     job = Job(data, root)
+    attempts = int(data.get("attempts") or 0) + 1
     if not data.get("started"):
-        job.update(state="running", started=time.time(), stage="preparando", progress=1.0)
+        job.update(state="running", started=time.time(), stage="preparando", progress=1.0, attempts=attempts)
     else:
-        job.update(state="running", stage="retomando")
+        job.update(state="running", stage="retomando", attempts=attempts)
     src = None
     try:
+        if attempts > MAX_ATTEMPTS:
+            raise JobFailed(f"o trabalho foi interrompido {MAX_ATTEMPTS} vezes no meio; desisti dele")
         if not ((job.dir / "plan.json").exists() and (job.dir / "index.json").exists()):
             src = open_source(job, inbox_root or inbox.INBOX_DIR)
             job.update(duration=src.info["duration"], has_video=src.info["has_video"])

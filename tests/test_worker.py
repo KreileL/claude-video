@@ -258,3 +258,24 @@ def test_url_to_internal_host_is_blocked(dirs, monkeypatch):
     worker.process(job, root=jobs)
     data = jobstore.load_job(job["id"], jobs)
     assert data["state"] == "failed"
+
+
+def test_tampered_download_marker_is_refused(dirs, tmp_path):
+    jobs, _box = dirs
+    job = new_job(jobs, value="https://example.com/v", kind="url")
+    work = jobstore.job_path(job["id"], jobs) / "work"
+    work.mkdir()
+    (work / "download.done").write_text("../../../etc/passwd", encoding="utf-8")
+    worker.process(job, root=jobs)
+    data = jobstore.load_job(job["id"], jobs)
+    assert data["state"] == "failed"
+
+
+def test_job_that_keeps_crashing_the_worker_is_failed(dirs):
+    jobs, box = dirs
+    make_clip(box / "clip.mp4", seconds=5)
+    job = new_job(jobs)
+    jobstore.update_job(job["id"], jobs, state="running", started=1.0e12, attempts=worker.MAX_ATTEMPTS)
+    worker.process(jobstore.load_job(job["id"], jobs), root=jobs, inbox_root=box)
+    data = jobstore.load_job(job["id"], jobs)
+    assert data["state"] == "failed" and "interrompido" in data["error"]

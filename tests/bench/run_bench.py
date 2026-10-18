@@ -186,7 +186,7 @@ def drafts() -> None:
     out_dir = DATA / "drafts"
     out_dir.mkdir(parents=True, exist_ok=True)
     for clip in clips():
-        if clip["kind"] == "real-official":
+        if clip["kind"] != "real-approx":
             continue
         hyp, _ = transcribe(clip["audio"], "Systran/faster-whisper-large-v3", None)
         (out_dir / f"{clip['id']}.txt").write_text(hyp + "\n", encoding="utf-8")
