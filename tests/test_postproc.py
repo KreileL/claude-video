@@ -736,3 +736,24 @@ def test_p5_trash_leftovers_count_against_the_cap(env):
     left.mkdir(parents=True)
     (left / "audio.mp3").write_bytes(b"x" * 5000)
     assert worker.cache_used(jobs) == 5000
+
+
+def test_no_speech_note_says_so_and_calls_no_provider(env):
+    jobs, vault, calls = env
+    jid = done_job(jobs, segments=[])
+    postproc.finish(jid)
+    job = jobstore.load_job(jid, jobs)
+    assert job["resumo"] == "sem-fala" and job["export"] == "ok" and calls == []
+    folder = folder_of(vault, jid)
+    note = (folder / "Meu vídeo.md").read_text(encoding="utf-8")
+    assert "resumo: sem-fala" in note and "Sem fala no áudio" in note and "falhou" not in note
+    assert "(sem fala no áudio)" in (folder / "Transcrição.md").read_text(encoding="utf-8")
+    assert postproc.retry_due(now=time.time() + 10**7) == 0
+
+
+def test_note_shows_the_detected_language(env):
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    jobstore.update_job(jid, jobs, language=None, language_detected="en")
+    postproc.finish(jid)
+    assert 'idioma: "en (detectado)"' in (folder_of(vault, jid) / "Meu vídeo.md").read_text(encoding="utf-8")

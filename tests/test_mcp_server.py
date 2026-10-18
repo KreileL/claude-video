@@ -540,3 +540,53 @@ def test_strays_killed_even_when_parent_already_exited(tmp_path):
                                    cwd=tmp_path, timeout=0.3, ctx=None, label="t"))
     time.sleep(1.5)
     assert not marker.exists()
+
+
+# ── v3 adjustments: no speech, automatic language, clean URL ────────────────
+
+
+def _proc_with_stderr(stderr: str, seen: list | None = None):
+    async def proc(argv, **kw):
+        if seen is not None:
+            seen.append({"argv": argv, "env": kw.get("env") or {}})
+        return 0, json.dumps({"title": "u", "duration": 1}) if argv[0] == "yt-dlp" else "", (
+            "" if argv[0] == "yt-dlp" else stderr)
+    return proc
+
+
+def test_no_speech_is_said_as_such_not_as_a_failure(fake_pipeline, monkeypatch):
+    monkeypatch.setattr(mcp_server, "run_process", _proc_with_stderr(
+        "[watch] whisper fallback failed: Whisper returned no transcript segments\n"))
+    text = run(mcp_server.watch_video("http://public.test/x", detail="transcript"))[0].text
+    assert "Sem fala no áudio" in text and "falhou" not in text
+    assert "Sem fala no áudio" in run(mcp_server.transcribe_video("http://public.test/x"))  # not an error
+
+
+def test_a_real_whisper_error_is_still_a_failure(fake_pipeline, monkeypatch):
+    monkeypatch.setattr(mcp_server, "run_process", _proc_with_stderr(
+        "[watch] whisper fallback failed: Whisper request failed: HTTP Error 503\n"))
+    text = run(mcp_server.watch_video("http://public.test/x", detail="transcript"))[0].text
+    assert "Transcrição Whisper falhou" in text
+    with pytest.raises(ToolError, match="Nenhuma transcrição"):
+        run(mcp_server.transcribe_video("http://public.test/x"))
+
+
+def test_language_is_auto_by_default_and_an_explicit_code_is_forwarded(fake_pipeline, monkeypatch):
+    seen = []
+    monkeypatch.setattr(mcp_server, "run_process", _proc_with_stderr("", seen))
+    run(mcp_server.watch_video("http://public.test/x", detail="transcript"))
+    assert "WATCH_WHISPER_LANGUAGE" not in seen[-1]["env"]
+    run(mcp_server.watch_video("http://public.test/x", detail="transcript", language="EN"))
+    assert seen[-1]["env"]["WATCH_WHISPER_LANGUAGE"] == "en"
+    with pytest.raises(ToolError, match="language"):
+        run(mcp_server.watch_video("http://public.test/x", language="pt; rm -rf"))
+
+
+def test_tracking_parameters_never_reach_the_job(tmp_path, monkeypatch):
+    import jobstore
+    monkeypatch.setattr(jobstore, "JOBS_DIR", tmp_path)
+    monkeypatch.setattr(mcp_server.netguard, "validate_url", lambda url: url)
+    job, _ = mcp_server.enqueue_analysis("https://www.instagram.com/reel/DeX7nFXC_Hm/?dlrf=MXJ2OXVmYWx4MTl3aA==")
+    assert job["source"]["value"] == "https://www.instagram.com/reel/DeX7nFXC_Hm/"
+    again, reused = mcp_server.enqueue_analysis("https://www.instagram.com/reel/DeX7nFXC_Hm/?igsh=abc")
+    assert reused and again["id"] == job["id"]  # other share link, same video

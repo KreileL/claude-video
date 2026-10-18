@@ -164,6 +164,9 @@ def stored_summary(job_dir: Path) -> str | None:
 
 def try_summary(job: dict, mat: dict, root: Path | None) -> str | None:
     """One summary attempt; updates the job's resumo fields. Returns the text or None."""
+    if not mat["segments"]:  # silence or music: nothing to summarize, not an error
+        jobstore.update_job(job["id"], root, resumo="sem-fala")
+        return None
     if not summary_wanted(job):
         jobstore.update_job(job["id"], root, resumo="desligado")
         return None
@@ -207,7 +210,7 @@ def try_summary(job: dict, mat: dict, root: Path | None) -> str | None:
 
 def _status_for_note(job: dict) -> str:
     state = job.get("resumo")
-    return state if state in ("ok", "desligado") else "pendente"
+    return state if state in ("ok", "desligado", "sem-fala") else "pendente"
 
 
 def _index_file(title: str) -> str:
@@ -293,7 +296,7 @@ def build_folder(job: dict, mat: dict, summary: str | None, entrada_root: Path |
         "title": title, "job_id": job["id"], "date": _date(job), "origem": origem_of(job),
         "duration": jobstore.as_number(job.get("duration")) or None,
         "autor": meta.get("uploader") or meta.get("channel"), "modelo": job.get("model"),
-        "idioma": job.get("language") or "automático", "resumo_status": status,
+        "idioma": jobview.language_label(job), "resumo_status": status,
         "summary": demote(summary) if summary else None,
         "highlights": [] if summary else highlights(mat["segments"]), "frames": note_frames,
         "origin_kind": (job.get("source") or {}).get("kind"),
@@ -343,7 +346,7 @@ def run_export(job_id: str, root: Path | None = None, entrada_root: Path | None 
         mat = _material(job, root)
         summary = stored_summary(job_dir)
         due = job.get("resumo") != "pendente" or jobstore.as_number(job.get("resumo_next")) <= time.time()
-        if summary is None and summarize and due and job.get("resumo") not in ("desligado", "erro"):
+        if summary is None and summarize and due and job.get("resumo") not in ("desligado", "erro", "sem-fala"):
             summary = try_summary(job, mat, root)
             job = jobstore.load_job(job_id, root)
         if not entrada.available(entrada_root):

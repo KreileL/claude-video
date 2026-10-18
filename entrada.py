@@ -398,7 +398,7 @@ def render_transcript(title: str, segments: list[dict]) -> str:
         if start is None or not text:
             continue
         lines.append(f"[{hms(start)}] {text}")
-    body = "\n".join(lines) if lines else "_(sem fala reconhecida)_"
+    body = "\n".join(lines) if lines else "_(sem fala no áudio)_"
     return f"# Transcrição — {_md_line(title)}\n\n{body}\n"
 
 
@@ -414,7 +414,7 @@ def _check_info(info: dict) -> tuple[str, str]:
 def render_index(info: dict) -> str:
     job_id, date = _check_info(info)
     status = info.get("resumo_status")
-    if status not in ("ok", "pendente", "desligado"):
+    if status not in ("ok", "pendente", "desligado", "sem-fala"):
         raise EntradaError("estado do resumo inválido")
     title = info.get("title", "")
     summary = info.get("summary")
@@ -445,6 +445,8 @@ def render_index(info: dict) -> str:
         out.append(sanitize_markdown(summary).strip())
     elif status == "desligado":
         out.append("> [!info] Resumo desligado para esta origem.")
+    elif status == "sem-fala":
+        out.append("> [!info] Sem fala no áudio\n> O Whisper não reconheceu fala neste vídeo; não há o que resumir.")
     elif info.get("resumo_erro"):
         out.append("> [!warning] Resumo não gerado\n> O provedor recusou o pedido. Para tentar de novo: "
                    f"`docker exec watch-mcp-worker-v3 python /app/worker.py export {job_id} --again`.")
@@ -463,7 +465,8 @@ def render_index(info: dict) -> str:
             text = _md_line(h.get("text", "")) if isinstance(h, dict) else ""
             if t is not None and text:
                 pts.append(f"- [{hms(t)}] {text}")
-        out.append("\n".join(pts) if pts else "_(ver a transcrição)_")
+        out.append("\n".join(pts) if pts else
+                   ("_(sem fala no áudio)_" if status == "sem-fala" else "_(ver a transcrição)_"))
     out += ["", "## Fonte", f"- Origem: {_md_line(origem)}",
             f"- Duração: {hms(dur) if dur is not None else 'desconhecida'}"]
     if autor:
