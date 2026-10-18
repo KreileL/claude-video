@@ -358,3 +358,11 @@ def test_fallback_never_replaces_an_empty_dir_created_in_the_race_window(tmp_pat
     assert final == base + " (2)"
     assert list((root / base).iterdir()) == []  # untouched
     assert (root / final / "nota.md").read_text() == "x"
+
+
+def test_p2_names_fit_linux_name_max_in_bytes():
+    title = "😀" * 80
+    t = entrada.sanitize_title(title)
+    assert len(t.encode("utf-8")) <= entrada.TITLE_BYTES
+    folder = entrada.folder_name("2026-10-18", title, "a" * 32) + " (99)"
+    assert len(folder.encode("utf-8")) <= 255 and len(entrada.index_filename(title).encode("utf-8")) <= 255

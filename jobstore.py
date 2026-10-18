@@ -26,7 +26,8 @@ JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 STATES = ("queued", "running", "done", "failed")
 ORPHAN_AGE = 3600.0
 ARCHIVED = "archived"  # v3: exported to the Holocron; never expires (v2 cleanup also skips it)
-EXPORT_LOCK = ".export.lock"  # v3: held by the exporter, and by cleanup while it removes a job
+EXPORT_LOCK = ".export.lock"
+LOCK_STALE = 3600.0  # v3: held by the exporter, and by cleanup while it removes a job
 # Touched by the worker every few seconds; not a job dir, so every scan skips it.
 HEARTBEAT_FILE = ".heartbeat"
 
@@ -221,6 +222,11 @@ def _claim(path: str, name: str) -> bool:
     job may still be removed. The exporter holds the same lock, so a job is never
     deleted while it is being exported. The lock goes away with the directory."""
     lock = os.path.join(path, EXPORT_LOCK)
+    try:
+        if time.time() - os.lstat(lock).st_mtime > LOCK_STALE:
+            os.unlink(lock)  # left by a process that died (an export never takes this long)
+    except OSError:
+        pass
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except OSError:

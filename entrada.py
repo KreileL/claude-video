@@ -26,6 +26,7 @@ from urllib.parse import quote
 ENTRADA_DIR = Path(os.environ.get("WATCH_ENTRADA_DIR", "/entrada"))
 TMP_NAME = ".watch-tmp"
 TITLE_LIMIT = 80
+TITLE_BYTES = 150  # Linux NAME_MAX is 255 bytes; leaves room for date, id and suffix
 KEY_FRAMES_MIN, KEY_FRAMES_MAX = 10, 20
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -79,6 +80,8 @@ def sanitize_title(raw: object, limit: int = TITLE_LIMIT) -> str:
     s = re.sub(r"\.{2,}", ".", s)
     s = " ".join(s.split()).strip(" .")
     s = s[:limit].strip(" .")
+    while len(s.encode("utf-8")) > TITLE_BYTES:
+        s = s[:-1].rstrip(" .")
     if _RESERVED_RE.match(s.split(".")[0].strip().upper()):
         s = "_" + s
     if not s:
@@ -420,8 +423,14 @@ def render_index(info: dict) -> str:
     modelo = _one_line(info.get("modelo") or "")
     idioma = _one_line(info.get("idioma") or "")
     origem = info.get("origem", "")
+    export_id = info.get("export_id")
+    if export_id is not None and not (isinstance(export_id, str) and re.fullmatch(r"[0-9a-f]{16}", export_id)):
+        raise EntradaError("export_id inválido")
     fm = ["---", f"title: {_q(title)}", "tipo: entrada", "subtipo: video", "status: rascunho",
-          f"origem: {_q(origem)}", f"job_id: {_q(job_id)}",
+          f"origem: {_q(origem)}", f"job_id: {_q(job_id)}"]
+    if export_id:
+        fm.append(f"export_id: {_q(export_id)}")  # lets the worker recognize its own folder after a crash
+    fm += [
           f"data_processamento: {date}", f"data_criacao: {date}"]
     if dur is not None:
         fm.append(f"duracao: {_q(hms(dur))}")
@@ -440,7 +449,9 @@ def render_index(info: dict) -> str:
                    f"`docker exec watch-mcp-worker-v3 python /app/worker.py export {job_id} --again`.")
     else:
         out.append("> [!info] Resumo pendente\n> O resumo automático ainda não foi gerado; "
-                   "o worker tenta de novo e, quando conseguir, cria `Resumo.md` nesta pasta.")
+                   "o worker tenta de novo e, quando conseguir, cria `Resumo.md` nesta pasta. "
+                   "Se o provedor recusar de vez, peça de novo com "
+                   f"`docker exec watch-mcp-worker-v3 python /app/worker.py export {job_id} --again`.")
     out += ["", "## Pontos principais"]
     if isinstance(summary, str) and summary.strip():
         out.append("Ver o resumo acima.")
@@ -478,8 +489,9 @@ def render_resumo(info: dict, summary: str) -> str:
     if not _component_ok(index_file) or not index_file.endswith(".md"):
         raise EntradaError("nome da nota índice inválido")
     title = info.get("title", "")
-    fm = ["---", f"title: {_q('Resumo — ' + _one_line(title))}", "tipo: entrada",
-          "subtipo: resumo-video", "status: rascunho", f"job_id: {_q(job_id)}",
+    # job_id and subtipo first: the worker recognizes its own Resumo.md from the first bytes.
+    fm = ["---", f"job_id: {_q(job_id)}", "subtipo: resumo-video",
+          f"title: {_q('Resumo — ' + _one_line(title))}", "tipo: entrada", "status: rascunho",
           f"data_criacao: {date}", "resumo: ok", "metodo_ingestao: transcricao", "---", ""]
     body = [f"# Resumo — {_md_line(title)}", "", sanitize_markdown(summary).strip(), "",
             f"[Nota índice]({quote(index_file, safe='')})"]

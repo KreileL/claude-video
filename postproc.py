@@ -37,7 +37,7 @@ EXPORT_RETRY = float(os.environ.get("WATCH_EXPORT_RETRY_FIRST", "300"))
 EXPORT_RETRY_MAX = 3600.0
 LOCK_NAME = jobstore.EXPORT_LOCK
 RESERVED_NOTES = ("transcrição.md", "resumo.md")  # our fixed file names, compared casefolded
-LOCK_STALE = 3600.0
+LOCK_STALE = jobstore.LOCK_STALE
 SUMMARY_FILE = "summary.json"
 SUMMARY_FRAMES = 6
 HIGHLIGHTS = 8
@@ -206,7 +206,63 @@ def _status_for_note(job: dict) -> str:
     return state if state in ("ok", "desligado") else "pendente"
 
 
-def build_folder(job: dict, mat: dict, summary: str | None, entrada_root: Path | None) -> tuple[str, str]:
+def _index_file(title: str) -> str:
+    index_file = entrada.index_filename(title)
+    if _casefold(index_file) in RESERVED_NOTES:  # Windows: case-insensitive names
+        index_file = "Nota - " + index_file
+    return index_file
+
+
+def _head(path: Path, size: int = 8192) -> str:
+    """First bytes of a file we may have written, never following links; '' on any problem."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    except OSError:
+        return ""
+    try:
+        return os.read(fd, size).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    finally:
+        os.close(fd)
+
+
+def _find_published(job: dict, mat: dict, entrada_root: Path | None) -> str | None:
+    """The folder a previous attempt published before job.json recorded it (crash
+    between the rename and the update): matched by the attempt's export_id."""
+    export_id = (job.get("export_intent") or {}).get("id")
+    if not isinstance(export_id, str):
+        return None
+    root = entrada._root(entrada_root)
+    base = entrada.folder_name(_date(job), mat["title"], job["id"])
+    marker = f'export_id: "{export_id}"'
+    for n in range(1, 100):
+        name = base if n == 1 else f"{base} ({n})"
+        d = root / name
+        if jobstore.is_link(d) or not d.is_dir():
+            continue
+        if marker in _head(d / _index_file(mat["title"])):
+            return name
+    return None
+
+
+def publish_once(job: dict, mat: dict, summary: str | None, root: Path | None,
+                 entrada_root: Path | None) -> tuple[str, str, bool]:
+    """Publish a folder exactly once per attempt: an earlier attempt that crashed after
+    its rename is adopted instead of published again. Caller holds the lock and must
+    clear export_intent when it records the result."""
+    found = _find_published(job, mat, entrada_root)
+    if found is not None:
+        log(f"{job['id']}: pasta de uma tentativa anterior reconhecida: {found}")
+        return found, _index_file(mat["title"]), bool((job.get("export_intent") or {}).get("with_summary"))
+    export_id = os.urandom(8).hex()
+    jobstore.update_job(job["id"], root, export_intent={"id": export_id, "with_summary": bool(summary)})
+    folder, index_file = build_folder(job, mat, summary, entrada_root, export_id=export_id)
+    return folder, index_file, bool(summary)
+
+
+def build_folder(job: dict, mat: dict, summary: str | None, entrada_root: Path | None,
+                 export_id: str | None = None) -> tuple[str, str]:
     """Stage and publish one complete folder; returns (folder, index file name)."""
     staged = entrada.staging(entrada_root, job["id"])
     frames_dir = staged / "frames"
@@ -229,7 +285,7 @@ def build_folder(job: dict, mat: dict, summary: str | None, entrada_root: Path |
     title = mat["title"]
     status = "ok" if summary else _status_for_note(job)
     info = {
-        "resumo_erro": job.get("resumo") == "erro",
+        "resumo_erro": job.get("resumo") == "erro", "export_id": export_id,
         "title": title, "job_id": job["id"], "date": _date(job), "origem": origem_of(job),
         "duration": jobstore.as_number(job.get("duration")) or None,
         "autor": meta.get("uploader") or meta.get("channel"), "modelo": job.get("model"),
@@ -238,9 +294,7 @@ def build_folder(job: dict, mat: dict, summary: str | None, entrada_root: Path |
         "highlights": [] if summary else highlights(mat["segments"]), "frames": note_frames,
         "origin_kind": (job.get("source") or {}).get("kind"),
     }
-    index_file = entrada.index_filename(title)
-    if _casefold(index_file) in RESERVED_NOTES:  # Windows: case-insensitive names
-        index_file = "Nota - " + index_file
+    index_file = _index_file(title)
     entrada.create_file(staged / "Transcrição.md", entrada.render_transcript(title, mat["segments"]))
     entrada.create_file(staged / index_file, entrada.render_index(info))
     folder = entrada.publish(entrada_root, staged, entrada.folder_name(info["date"], title, job["id"]))
@@ -249,7 +303,8 @@ def build_folder(job: dict, mat: dict, summary: str | None, entrada_root: Path |
 
 def _mark_exported(job: dict, root: Path | None, folder: str, index_file: str, with_summary: bool) -> None:
     fields = {"export": "ok", "export_error": None, "export_next": None, "entrada_folder": folder,
-              "entrada_index": index_file, "exported_at": time.time(), "resumo_entregue": with_summary}
+              "entrada_index": index_file, "exported_at": time.time(), "resumo_entregue": with_summary,
+              "export_intent": None}
     if job.get("state") != jobstore.ARCHIVED:
         fields.update(state=jobstore.ARCHIVED, archived=True, archived_at=time.time(),
                       archived_from=job.get("state"))
@@ -291,13 +346,23 @@ def run_export(job_id: str, root: Path | None = None, entrada_root: Path | None 
             _export_pending(job, root, "pasta de entrada do Holocron indisponível ou sem escrita")
             return None
         try:
-            folder, index_file = build_folder(job, mat, summary, entrada_root)
+            folder, index_file, with_summary = publish_once(job, mat, summary, root, entrada_root)
         except (entrada.EntradaError, OSError) as exc:
-            _export_pending(job, root, f"falha ao gravar a nota ({type(exc).__name__})")
+            _export_pending(jobstore.load_job(job_id, root), root, f"falha ao gravar a nota ({type(exc).__name__})")
             return None
-        _mark_exported(job, root, folder, index_file, with_summary=bool(summary))
+        _mark_exported(job, root, folder, index_file, with_summary=with_summary)
         log(f"{job_id}: nota em {jobview.ENTRADA_LABEL}/{folder}")
         return folder
+    except (entrada.EntradaError, jobstore.JobError):
+        raise
+    except Exception as exc:  # noqa: BLE001 - recorded under the lock, then reported
+        try:
+            current = jobstore.load_job(job_id, root)
+            if current.get("export") != "ok":
+                _export_pending(current, root, f"erro interno ({type(exc).__name__})")
+        except Exception:  # noqa: BLE001
+            pass
+        raise
     finally:
         lock.unlink(missing_ok=True)
 
@@ -309,11 +374,8 @@ def _delivered(entrada_root: Path | None, folder: str, job_id: str) -> str | Non
         return None
     marker = f'job_id: "{job_id}"'
     for p in sorted(d.glob("Resumo*.md")):
-        try:
-            head = p.read_text(encoding="utf-8")[:2000]
-        except OSError:
-            continue
-        if not jobstore.is_link(p) and "subtipo: resumo-video" in head and marker in head:
+        head = _head(p, 4096)  # bounded, no links, any encoding: a user's file can't block us
+        if "subtipo: resumo-video" in head and marker in head:
             return p.name
     return None
 
@@ -354,9 +416,9 @@ def add_late_summary(job_id: str, root: Path | None = None, entrada_root: Path |
                                     resumo_entrega_next=None, resumo_entrega_attempts=None)
                 log(f"{job_id}: {name} em {folder}")
                 return
-            folder, index_file = build_folder(job, mat, summary, entrada_root)
+            folder, index_file, _ = publish_once(job, mat, summary, root, entrada_root)
             jobstore.update_job(job_id, root, resumo_file=None, resumo_entregue=True, entrada_folder=folder,
-                                entrada_index=index_file, exported_at=time.time(),
+                                entrada_index=index_file, exported_at=time.time(), export_intent=None,
                                 resumo_entrega_next=None, resumo_entrega_attempts=None)
             log(f"{job_id}: pasta original não encontrada; nova versão em {folder}")
         except (entrada.EntradaError, OSError) as exc:
@@ -373,12 +435,10 @@ def finish(job_id: str, root: Path | None = None, entrada_root: Path | None = No
     a job a manual export already published is left alone. Never raises."""
     try:
         run_export(job_id, root, entrada_root, if_done="return")
-    except Exception as exc:  # noqa: BLE001 - the job itself is already done
+    except Busy:
+        return  # someone else is exporting it; the state is theirs to write
+    except Exception as exc:  # noqa: BLE001 - run_export already recorded it under the lock
         log(f"{job_id}: pós-processamento falhou ({type(exc).__name__}); fica pendente")
-        try:
-            _export_pending(jobstore.load_job(job_id, root), root, f"erro interno ({type(exc).__name__})")
-        except Exception:  # noqa: BLE001
-            pass
 
 
 def awaiting_summary(job: dict) -> bool:

@@ -505,3 +505,120 @@ def test_export_without_summary_records_an_explicit_debt(env, monkeypatch):
     monkeypatch.setattr(resumo, "summarize", lambda s, **kw: resumo.Summary(SUMMARY, "gemini", "m", 1))
     postproc.finish(jid2)
     assert jobstore.load_job(jid2, jobs)["resumo_entregue"] is True
+
+
+# ── Codex v3 pass 2 ─────────────────────────────────────────────────────────
+
+
+def user_folders(vault):
+    return sorted(p.name for p in vault.iterdir() if p.is_dir() and not p.name.startswith("."))
+
+
+def test_p2_finish_finding_the_lock_busy_leaves_a_finished_export_alone(env):
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    assert postproc.run_export(jid)  # the manual export published and recorded "ok"...
+    (jobs / jid / postproc.LOCK_NAME).write_text("1")  # ...and still holds its lock
+    postproc.finish(jid)
+    assert jobstore.load_job(jid, jobs)["export"] == "ok"
+    (jobs / jid / postproc.LOCK_NAME).unlink()
+    postproc.retry_due(now=time.time() + 10**7)
+    assert len(user_folders(vault)) == 1
+
+
+def test_p2_a_user_file_in_another_encoding_does_not_block_delivery(env, monkeypatch):
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    monkeypatch.setattr(resumo, "summarize",
+                        lambda s, **kw: (_ for _ in ()).throw(resumo.ResumoError("erro de rede", transient=True)))
+    postproc.finish(jid)
+    folder = folder_of(vault, jid)
+    (folder / "Resumo pessoal.md").write_bytes("anotação minha".encode("latin-1") * 3000)
+    monkeypatch.setattr(resumo, "summarize", lambda s, **kw: resumo.Summary(SUMMARY, "gemini", "m", 1))
+    postproc.retry_due(now=time.time() + 10**6)
+    assert (folder / "Resumo.md").exists() and jobstore.load_job(jid, jobs)["resumo_entregue"] is True
+
+
+def test_p2_crash_after_the_initial_publish_is_adopted_not_duplicated(env, monkeypatch):
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    real = postproc._mark_exported
+    monkeypatch.setattr(postproc, "_mark_exported", lambda *a, **k: (_ for _ in ()).throw(OSError("parou")))
+    with pytest.raises(OSError):
+        postproc.run_export(jid)
+    assert jobstore.load_job(jid, jobs)["export"] == "pendente" and len(user_folders(vault)) == 1
+    monkeypatch.setattr(postproc, "_mark_exported", real)
+    postproc.retry_due(now=time.time() + 10**7)
+    job = jobstore.load_job(jid, jobs)
+    assert job["export"] == "ok" and job["state"] == "archived" and job["resumo_entregue"] is True
+    assert user_folders(vault) == [job["entrada_folder"]] and job.get("export_intent") is None
+
+
+def test_p2_late_summary_fallback_is_published_once(env, monkeypatch):
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    monkeypatch.setattr(resumo, "summarize",
+                        lambda s, **kw: (_ for _ in ()).throw(resumo.ResumoError("erro de rede", transient=True)))
+    postproc.finish(jid)
+    original = folder_of(vault, jid)
+    os.rename(original, vault.parent / "movida")
+    original.write_text("arquivo do usuário com o mesmo nome")  # the name is now taken
+    monkeypatch.setattr(resumo, "summarize", lambda s, **kw: resumo.Summary(SUMMARY, "gemini", "m", 1))
+    real_update = jobstore.update_job
+
+    def fail_recording(job_id, root=None, **fields):
+        if fields.get("resumo_entregue"):
+            raise OSError("estado não gravado")
+        return real_update(job_id, root, **fields)
+
+    monkeypatch.setattr(jobstore, "update_job", fail_recording)
+    for i in range(3):
+        postproc.retry_due(now=time.time() + 10**6 * (i + 1))
+    monkeypatch.setattr(jobstore, "update_job", real_update)
+    postproc.retry_due(now=time.time() + 10**8)
+    assert len(user_folders(vault)) == 1  # one new version, adopted on every retry
+    assert original.read_text() == "arquivo do usuário com o mesmo nome"
+    assert jobstore.load_job(jid, jobs)["resumo_entregue"] is True
+
+
+def test_p2_long_titles_do_not_hide_the_delivery_marker(env, monkeypatch):
+    jobs, vault, _ = env
+    jid = done_job(jobs, title="T" * 2200)
+    monkeypatch.setattr(resumo, "summarize",
+                        lambda s, **kw: (_ for _ in ()).throw(resumo.ResumoError("erro de rede", transient=True)))
+    postproc.finish(jid)
+    monkeypatch.setattr(resumo, "summarize", lambda s, **kw: resumo.Summary(SUMMARY, "gemini", "m", 1))
+    real_update = jobstore.update_job
+    state = {"n": 0}
+
+    def crash_once(job_id, root=None, **fields):
+        if fields.get("resumo_entregue") and state["n"] == 0:
+            state["n"] = 1
+            raise OSError("parou depois de gravar Resumo.md")
+        return real_update(job_id, root, **fields)
+
+    monkeypatch.setattr(jobstore, "update_job", crash_once)
+    postproc.retry_due(now=time.time() + 10**6)
+    postproc.retry_due(now=time.time() + 10**7)
+    assert sorted(p.name for p in folder_of(vault, jid).glob("Resumo*.md")) == ["Resumo.md"]
+
+
+def test_p2_a_stale_cleanup_claim_is_recovered(env):
+    jobs, _, _ = env
+    jid = done_job(jobs)
+    legacy(jobs, jid)
+    lock = jobs / jid / jobstore.EXPORT_LOCK
+    lock.write_text("1")
+    old = time.time() - 2 * jobstore.LOCK_STALE
+    os.utime(lock, (old, old))
+    assert jobstore.cleanup(jobs, ttl_seconds=1, max_bytes=0, now=time.time() + 10**7) == [jid]
+
+
+def test_p2_pending_note_says_how_to_retry_if_the_provider_refuses(env, monkeypatch):
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+    monkeypatch.setattr(resumo, "summarize",
+                        lambda s, **kw: (_ for _ in ()).throw(resumo.ResumoError("erro de rede", transient=True)))
+    postproc.finish(jid)
+    note = (folder_of(vault, jid) / "Meu vídeo.md").read_text(encoding="utf-8")
+    assert "Resumo pendente" in note and f"export {jid} --again" in note
