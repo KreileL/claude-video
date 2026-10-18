@@ -6,6 +6,7 @@ the rest of this module stays testable without it.
 """
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -97,8 +98,18 @@ class Api:
         return [u for u in result if isinstance(u, dict)] if isinstance(result, list) else []
 
     def send(self, chat_id: int, text: str) -> None:
-        self.call("sendMessage", {"chat_id": chat_id, "text": text,
-                                  "disable_web_page_preview": True}, 20)
+        """`text` is Telegram HTML: our own <code> tags, dynamic parts through esc().
+        If Telegram refuses the markup (400), the same text goes out plain."""
+        params = {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
+                  "disable_web_page_preview": True}
+        try:
+            self.call("sendMessage", params, 20)
+        except TelegramError as exc:
+            if exc.status != 400:
+                raise
+            plain = html.unescape(re.sub(r"</?code>", "", text))
+            self.call("sendMessage", {"chat_id": chat_id, "text": plain,
+                                      "disable_web_page_preview": True}, 20)
 
 
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -140,6 +151,15 @@ def _bounded(call, seconds: float):
     if "error" in box:
         raise box["error"]
     return box["value"]
+
+
+def esc(text: object) -> str:
+    """Dynamic content inside an HTML message (Telegram needs <, > and & escaped)."""
+    return html.escape(str(text), quote=False)
+
+
+def code(text: object) -> str:
+    return f"<code>{esc(text)}</code>"
 
 
 def is_allowed(update: dict, allowed: int = ALLOWED_USER) -> bool:
@@ -220,7 +240,7 @@ def _is_ready(job: dict) -> bool:
 
 
 def _ready_text(job: dict) -> str:
-    return f"Pronto — nota em {ENTRADA_LABEL}/{job['entrada_folder']}"
+    return "Pronto — nota em " + esc(f"{ENTRADA_LABEL}/{job['entrada_folder']}")
 
 
 def status_text(state: dict, root: Path | None = None) -> str:
@@ -228,10 +248,10 @@ def status_text(state: dict, root: Path | None = None) -> str:
     for p in state.get("pending", []):
         job = _job_state(p["job_id"], root)
         if job is None:
-            lines.append(f"{p.get('short', '?')} — desconhecido")
+            lines.append(f"{code(p.get('short', '?'))} — desconhecido")
             continue
         pt = STATE_PT.get(job.get("state"), "desconhecido")
-        lines.append(f"{p.get('short', '?')} — {pt} {jobstore.as_number(job.get('progress')):.0f}%")
+        lines.append(f"{code(p.get('short', '?'))} — {esc(pt)} {jobstore.as_number(job.get('progress')):.0f}%")
     return "\n".join(lines) if lines else "Nada em andamento."
 
 
@@ -263,7 +283,7 @@ def handle_update(update: dict, *, api: Api, state: dict,
             job, reused = enqueue(url)
             short = str(job["id"])[:8]
         except Exception as exc:  # noqa: BLE001 - shown to the user, redacted
-            _reply(api, chat_id, "Não consegui enfileirar: " + redact(str(exc), api.token)[:300])
+            _reply(api, chat_id, "Não consegui enfileirar: " + esc(redact(str(exc), api.token)[:300]))
             continue
         if _is_ready(job):
             # Tracked like any job: check_pending sends "Pronto" and retries if sending fails.
@@ -275,8 +295,8 @@ def handle_update(update: dict, *, api: Api, state: dict,
         if not any(p["job_id"] == job["id"] for p in state["pending"]):
             state["pending"].append({"job_id": job["id"], "chat_id": chat_id,
                                      "short": short, "since": time.time()})
-        _reply(api, chat_id, (f"Já processado ou em andamento — ID `{short}`" if reused
-                              else f"Na fila — ID `{short}`"))
+        _reply(api, chat_id, (f"Já processado ou em andamento — ID {code(short)}" if reused
+                              else f"Na fila — ID {code(short)}"))
 
 
 def check_pending(*, api: Api, state: dict, root: Path | None = None) -> None:
@@ -294,7 +314,7 @@ def check_pending(*, api: Api, state: dict, root: Path | None = None) -> None:
         chat_id, short = p.get("chat_id"), p.get("short", "?")
         job = _job_state(p["job_id"], root)
         if job is None:
-            if not sent(chat_id, f"Trabalho {short} não encontrado."):
+            if not sent(chat_id, f"Trabalho {code(short)} não encontrado."):
                 keep.append(p)
             continue
         if _is_ready(job):
@@ -303,14 +323,14 @@ def check_pending(*, api: Api, state: dict, root: Path | None = None) -> None:
             continue
         if job.get("state") == "failed":
             err = str(job.get("error") or "erro desconhecido").splitlines() or [""]
-            if not sent(chat_id, f"Falhou — {short}: {redact(err[0], api.token)[:300]}"):
+            if not sent(chat_id, f"Falhou — {code(short)}: {esc(redact(err[0], api.token)[:300])}"):
                 keep.append(p)
             continue
         if job.get("state") in ("done", "archived") and job.get("export") == "pendente" \
                 and not p.get("warned"):
             done_at = jobstore.as_number(job.get("finished")) or jobstore.as_number(job.get("updated"))
             if time.time() - done_at > EXPORT_WARN_AFTER:
-                api.send(chat_id, f"Pronto — {short} concluído; a nota no Holocron está pendente "
+                api.send(chat_id, f"Pronto — {code(short)} concluído; a nota no Holocron está pendente "
                                   "e sai assim que a pasta estiver acessível.")
                 p["warned"] = True
         keep.append(p)

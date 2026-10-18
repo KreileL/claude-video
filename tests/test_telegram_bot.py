@@ -251,7 +251,7 @@ def test_check_pending_ready_failed_missing(tmp_path):
     tb.check_pending(api=api, state=state, root=tmp_path)
     assert api.sent[0] == "Pronto — nota em 00 - Entrada/2026-10-18 Nota"
     assert api.sent[1].startswith("Falhou") and "linha2" not in api.sent[1] and TOKEN not in api.sent[1]
-    assert api.sent[2] == "Trabalho ffffffff não encontrado."
+    assert api.sent[2] == "Trabalho <code>ffffffff</code> não encontrado."
     assert state["pending"] == []
 
 
@@ -432,3 +432,46 @@ def test_p4_timed_out_calls_are_capped(monkeypatch):
         assert len(tb._ABANDONED) == tb.MAX_ABANDONED  # refused calls start no new thread
     finally:
         release.set()
+
+
+# ── v3 adjustments: HTML formatting ─────────────────────────────────────────
+
+
+def test_ids_go_in_code_tags_and_dynamic_text_is_escaped():
+    sent = []
+
+    class Api:
+        token = TOKEN
+
+        def send(self, chat_id, text):
+            sent.append(text)
+
+    state = {"offset": None, "pending": []}
+    msg = {"chat": {"id": tb.ALLOWED_USER, "type": "private"}, "from": {"id": tb.ALLOWED_USER, "is_bot": False}}
+    tb.handle_update({"update_id": 1, "message": {**msg, "text": "https://youtu.be/a"}}, api=Api(), state=state,
+                     enqueue=lambda url: ({"id": "ab12cd34" + "0" * 24, "state": "queued"}, False))
+    assert sent[-1] == "Na fila — ID <code>ab12cd34</code>" and "`" not in sent[-1]
+
+    def refuse(url):
+        raise Exception("URL recusada: <script>&x</script>")
+
+    tb.handle_update({"update_id": 2, "message": {**msg, "text": "https://evil/x"}}, api=Api(), state=state,
+                     enqueue=refuse)
+    assert sent[-1] == "Não consegui enfileirar: URL recusada: &lt;script&gt;&amp;x&lt;/script&gt;"
+
+
+def test_send_uses_html_and_falls_back_to_plain_text_when_refused():
+    calls = []
+
+    class Api(tb.Api):
+        def call(self, method, params, timeout):
+            calls.append(params)
+            if params.get("parse_mode") == "HTML" and "quebrado" in params["text"]:
+                raise tb.TelegramError("Telegram respondeu HTTP 400 em sendMessage", status=400)
+            return {}
+
+    api = Api(TOKEN)
+    api.send(1, "Na fila — ID <code>ab12</code>")
+    assert calls[-1]["parse_mode"] == "HTML"
+    api.send(1, "texto quebrado <code>x &amp; y</code>")
+    assert "parse_mode" not in calls[-1] and calls[-1]["text"] == "texto quebrado x & y"
