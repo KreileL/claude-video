@@ -6,8 +6,9 @@ Este fork do [bradautomates/claude-video](https://github.com/bradautomates/claud
 - **Whisper local com foco em pt-BR:** transcrição na própria máquina (speaches), com modelos escolhidos por benchmark em português do Brasil.
 - **Caixa de entrada:** arquivos de vídeo e áudio em `D:\Inbox`, lidos somente leitura.
 - **Vídeos longos em segundo plano:** um worker processa trabalhos de horas, com retomada, busca na transcrição e índice de cenas.
+- **Notas no Obsidian:** cada vídeo processado vira uma nota com resumo (Gemini), transcrição e frames-chave na pasta de entrada do cofre; um bot do Telegram também enfileira links.
 
-Detalhes nas seções [MCP local](#mcp-local) e [MCP local v2](#mcp-local-v2). Todo o restante (a skill `/watch`) é do projeto original, de [bradautomates](https://github.com/bradautomates), a quem vai o crédito.
+Detalhes nas seções [MCP local](#mcp-local), [MCP local v2](#mcp-local-v2) e [MCP local v3](#mcp-local-v3). Todo o restante (a skill `/watch`) é do projeto original, de [bradautomates](https://github.com/bradautomates), a quem vai o crédito.
 
 ---
 
@@ -406,6 +407,68 @@ Para voltar atrás, restaure o backup do config e reinicie o Claude Desktop. O `
 ```
 
 Resultados e detalhes: seção "v2 — end-to-end results" do [NOTES-mcp.md](NOTES-mcp.md).
+
+## MCP local v3
+
+A v3 (branch `mcp-v3`, imagem `watch-mcp:v3`) mantém tudo da v2 e acrescenta:
+
+1. **Notas no Holocron:** todo trabalho concluído vira, sozinho, uma pasta em `00 - Entrada` do cofre, com a nota índice (resumo), a transcrição e de 10 a 20 frames-chave.
+2. **Arquivamento:** o trabalho exportado fica arquivado no volume `watch-mcp-jobs` sem prazo (sem o vídeo). `search_transcript` e `watch_video(job_id=...)` funcionam nele a qualquer momento.
+3. **Bot do Telegram** (`@InstWhisperBot`): mande um link (Instagram, YouTube, TikTok) e ele enfileira o trabalho e avisa quando a nota estiver pronta.
+4. **Resumo automático** pelo Gemini (`gemini-3.8-flash`), ou Claude, ou desligado.
+
+### Como funciona
+
+- O `watch-worker-v3` é o worker da v2 com uma etapa a mais: ao concluir um trabalho, ele pede o resumo, monta a pasta numa área temporária oculta (`00 - Entrada/.watch-tmp/<job_id>`) e a publica com um único rename. Depois marca o trabalho como `archived`.
+- **Só criar:** o worker nunca sobrescreve nem apaga nada em `00 - Entrada`. Se o nome existe, usa ` (2)`, ` (3)`. Só a pasta `00 - Entrada` do cofre é montada, e só no worker.
+- **Título hostil:** o nome da pasta vem do título do post ou do arquivo, saneado (sem separadores, `..`, nomes reservados do Windows, caracteres de controle) e conferido por `realpath`. O texto da nota passa por um filtro (sem HTML, sem links locais, sem embeds `![[...]]`).
+- **Resumo:** chamada HTTP direta, só texto e alguns frames, sem ferramentas. A transcrição vai delimitada como dado. Se o provedor falhar (limite gratuito, rede, chave), a nota sai com `resumo: pendente` e o worker tenta de novo (5 min, dobrando até 6 h); quando consegue, cria `Resumo.md` na pasta (ou uma pasta nova, se você já tiver movido a original).
+- **Cofre indisponível:** o trabalho conclui normalmente e a nota fica pendente, refeita quando a pasta voltar.
+- **Bot:** long polling (só conexões de saída, sem webhook, sem porta). Aceita só o usuário `1779779810` em chat privado e ignora em silêncio qualquer outro remetente. Usa a mesma validação e fila do `analyze_video`. Comandos `/status` e `/ajuda`.
+
+> [!warning] Plano gratuito do Gemini
+> No plano gratuito, o Google declara que o conteúdo enviado é usado para melhorar os produtos. Para não enviar arquivos locais, defina `WATCH_RESUMO_CAIXA_ENTRADA: "0"` no `watch-worker-v3`; para desligar o resumo de vez, `WATCH_RESUMO_PROVIDER: none`.
+
+### Subir
+
+```powershell
+docker build -t watch-mcp:v3 .
+docker stop watch-mcp-worker                       # nunca dois workers na mesma fila
+docker compose -p watch-mcp --profile v3 up -d watch-worker-v3 watch-telegram
+```
+
+Segredos (Docker secrets, lidos de `%USERPROFILE%\.config\watch\secrets\`): `gemini-api-key.txt` (só o worker) e `telegram-bot-token.txt` (só o bot). Os cookies do worker continuam como na v2. O caminho do cofre pode ser trocado com `WATCH_ENTRADA_HOST_DIR`.
+
+### Exportar um trabalho antigo
+
+Trabalhos concluídos antes da v3 só viram nota quando você pede:
+
+```powershell
+docker exec watch-mcp-worker-v3 python /app/worker.py export <job_id>            # --again cria uma nova versão
+```
+
+### Configuração
+
+| Variável (no `watch-worker-v3`) | Padrão | Para quê |
+|---|---|---|
+| `WATCH_RESUMO_PROVIDER` | `gemini` | `gemini`, `claude` ou `none` |
+| `WATCH_GEMINI_MODEL` | `gemini-3.8-flash` | modelo do resumo |
+| `WATCH_RESUMO_CAIXA_ENTRADA` | `1` | `0` desliga o resumo de arquivos locais |
+| `WATCH_ENTRADA_HOST_DIR` | `%USERPROFILE%\Documents\Projetos\Obsidian\00 - Entrada` | pasta de entrada do cofre |
+| `WATCH_UTC_OFFSET_HOURS` | `-3` | fuso da data no nome da pasta |
+
+### Voltar para a v2
+
+`docker compose -p watch-mcp --profile v3 stop watch-worker-v3 watch-telegram`, `docker start watch-mcp-worker` e, no Claude Desktop, a entrada `watch` de volta para `watch-mcp:v2` (backup do config). Os trabalhos arquivados continuam protegidos também na v2: a limpeza dela só apaga trabalhos `done` ou `failed`.
+
+### Testes da v3
+
+```powershell
+.venv\Scripts\python -m pytest -q
+.venv\Scripts\python tests\e2e\e2e_v3.py --volume watch-mcp-v3test-jobs --entrada <pasta-temp> --key <arquivo-da-chave> --url <URL curta>
+```
+
+O roteiro recusa o volume real. Resultados em [NOTES-mcp.md](NOTES-mcp.md), seção "v3".
 
 ## Structure
 
