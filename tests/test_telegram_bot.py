@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import jobstore  # noqa: E402
 import telegram_bot as tb  # noqa: E402
 
-TOKEN = "123456:FAKE-token_ABCdef"
+TOKEN = "123456:FAKE-token_ABCdef0123456789abcdefXYZ"
 ME = tb.ALLOWED_USER
 
 
@@ -278,3 +278,37 @@ def test_save_state_refuses_symlink(tmp_path):
     with pytest.raises(tb.TelegramError):
         tb.save_state({"offset": 1, "pending": []}, tmp_path)
     assert not list(target.iterdir())
+
+
+# ── Codex v3 pass 1 ─────────────────────────────────────────────────────────
+
+
+def test_p1_malformed_token_is_refused_without_echoing_it(tmp_path):
+    f = tmp_path / "t"
+    f.write_text("123456:FIRST-FAKE-token-aaaaaaaaaaaaaaaaaaaaaaa\n999:SECOND-FAKE\n")
+    with pytest.raises(tb.TelegramError) as err:
+        tb.read_token(f)
+    assert "FIRST-FAKE" not in str(err.value) and "formato inválido" in str(err.value)
+
+
+def test_p1_failed_reply_keeps_enqueuing_and_tracking(monkeypatch):
+    sent, queued = [], []
+
+    class FlakyApi:
+        token = TOKEN
+
+        def send(self, chat_id, text):
+            sent.append(text)
+            raise tb.TelegramError("Telegram respondeu HTTP 503 em sendMessage", status=503)
+
+    def enqueue(url):
+        queued.append(url)
+        return {"id": f"{len(queued):032x}", "state": "queued"}, False
+
+    state = {"offset": None, "pending": []}
+    update = {"update_id": 1, "message": {"chat": {"id": tb.ALLOWED_USER, "type": "private"},
+                                          "from": {"id": tb.ALLOWED_USER, "is_bot": False},
+                                          "text": "https://youtu.be/a https://youtu.be/b"}}
+    tb.handle_update(update, api=FlakyApi(), state=state, enqueue=enqueue)
+    assert queued == ["https://youtu.be/a", "https://youtu.be/b"]
+    assert [p["job_id"] for p in state["pending"]] == [f"{1:032x}", f"{2:032x}"]

@@ -28,6 +28,7 @@ ENTRADA_LABEL = "00 - Entrada"
 PENDING_CHECK_EVERY = 10.0
 EXPORT_WARN_AFTER = 30 * 60
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
+TOKEN_RE = re.compile(r"^[0-9]{5,15}:[A-Za-z0-9_-]{30,64}$")  # a newline would end up in the URL
 TRAILING = ".,;:!?)»”'\""
 HELP = ("Mande um link de vídeo do Instagram, YouTube ou TikTok. "
         f"A nota aparece em \"{ENTRADA_LABEL}\".\nComandos: /status e /ajuda")
@@ -59,6 +60,8 @@ def read_token(path: Path = TOKEN_FILE) -> str:
         token = ""
     if not token:
         raise TelegramError("token do Telegram ausente")
+    if not TOKEN_RE.fullmatch(token):
+        raise TelegramError("token do Telegram em formato inválido (confira o arquivo do secret)")
     return token
 
 
@@ -186,6 +189,14 @@ def status_text(state: dict, root: Path | None = None) -> str:
     return "\n".join(lines) if lines else "Nada em andamento."
 
 
+def _reply(api: Api, chat_id: int, text: str) -> None:
+    """A failed reply must not stop the other links of the message nor lose tracking."""
+    try:
+        api.send(chat_id, text)
+    except TelegramError as exc:
+        _log(f"resposta não enviada: {exc}", api.token)
+
+
 def handle_update(update: dict, *, api: Api, state: dict,
                   enqueue: Callable[[str], tuple[dict, bool]]) -> None:
     if not is_allowed(update):
@@ -206,16 +217,17 @@ def handle_update(update: dict, *, api: Api, state: dict,
             job, reused = enqueue(url)
             short = str(job["id"])[:8]
         except Exception as exc:  # noqa: BLE001 - shown to the user, redacted
-            api.send(chat_id, "Não consegui enfileirar: " + redact(str(exc), api.token)[:300])
+            _reply(api, chat_id, "Não consegui enfileirar: " + redact(str(exc), api.token)[:300])
             continue
         if _is_ready(job):
-            api.send(chat_id, _ready_text(job))
+            _reply(api, chat_id, _ready_text(job))
             continue
-        api.send(chat_id, (f"Já processado ou em andamento — ID `{short}`" if reused
-                           else f"Na fila — ID `{short}`"))
+        # Track first: the "ready" message must come even if this reply fails.
         if not any(p["job_id"] == job["id"] for p in state["pending"]):
             state["pending"].append({"job_id": job["id"], "chat_id": chat_id,
                                      "short": short, "since": time.time()})
+        _reply(api, chat_id, (f"Já processado ou em andamento — ID `{short}`" if reused
+                              else f"Na fila — ID `{short}`"))
 
 
 def check_pending(*, api: Api, state: dict, root: Path | None = None) -> None:
