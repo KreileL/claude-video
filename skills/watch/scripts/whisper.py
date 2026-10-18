@@ -333,12 +333,20 @@ MAX_429_RETRIES = 2
 RETRY_BASE_DELAY = 2.0
 
 
-def _post_whisper(endpoint: str, api_key: str | None, model: str, audio_path: Path) -> dict:
+def _post_whisper(
+    endpoint: str,
+    api_key: str | None,
+    model: str,
+    audio_path: Path,
+    extra: dict[str, str | None] | None = None,
+) -> dict:
     fields = {
         "model": model,
         "response_format": "verbose_json",
         "temperature": "0",
     }
+    # Optional OpenAI-API form fields (language, prompt); empty ones are not sent.
+    fields.update({k: v for k, v in (extra or {}).items() if v})
     body, boundary = _build_multipart(fields, audio_path)
     headers = {
         "Content-Type": f"multipart/form-data; boundary={boundary}",
@@ -518,6 +526,27 @@ def _transcribe_file(backend: str, api_key: str, audio_path: Path) -> list[dict]
         response = _post_whisper(OPENAI_ENDPOINT, api_key, OPENAI_MODEL, audio_path)
     else:
         raise SystemExit(f"Unknown whisper backend: {backend}")
+    return _segments_from_response(response)
+
+
+def transcribe_local(
+    audio_path: Path,
+    *,
+    model: str,
+    language: str | None = None,
+    prompt: str | None = None,
+) -> list[dict]:
+    """One request to the local server with an explicit model, language and
+    initial prompt; returns 0-based segments. For callers that do their own
+    chunking (the MCP v2 worker). Raises SystemExit like the rest of this module.
+    """
+    response = _post_whisper(
+        local_endpoint(),
+        setting(API_KEY_KEY),
+        model,
+        audio_path,
+        {"language": language, "prompt": prompt},
+    )
     return _segments_from_response(response)
 
 

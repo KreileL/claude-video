@@ -178,3 +178,31 @@ def test_openai_backend_never_posts_to_local_endpoint(monkeypatch, tmp_path):
     audio.write_bytes(b"x")
     whisper._transcribe_file("openai", "sk-synthetic", audio)
     assert seen == {"endpoint": whisper.OPENAI_ENDPOINT, "model": whisper.OPENAI_MODEL}
+
+
+def _form_fields(body: bytes) -> dict[str, str]:
+    fields = {}
+    for part in body.split(b"--")[1:]:
+        head, _, value = part.partition(b"\r\n\r\n")
+        if b'name="' in head and b"filename=" not in head:
+            name = head.split(b'name="', 1)[1].split(b'"', 1)[0].decode()
+            fields[name] = value.rsplit(b"\r\n", 1)[0].decode()
+    return fields
+
+
+def test_transcribe_local_sends_language_and_prompt(server, audio, monkeypatch):
+    monkeypatch.setenv("WATCH_WHISPER_URL", server["url"])
+    segments = whisper.transcribe_local(audio, model="m-x", language="pt", prompt="Ônibus, celular.")
+    assert [s["text"] for s in segments] == ["olá", "mundo"]
+    fields = _form_fields(server["requests"][0]["body"])
+    assert fields["model"] == "m-x"
+    assert fields["language"] == "pt"
+    assert fields["prompt"] == "Ônibus, celular."
+    assert "Authorization" not in server["requests"][0]["headers"]
+
+
+def test_transcribe_local_omits_empty_options(server, audio, monkeypatch):
+    monkeypatch.setenv("WATCH_WHISPER_URL", server["url"])
+    whisper.transcribe_local(audio, model="m-x")
+    fields = _form_fields(server["requests"][0]["body"])
+    assert "language" not in fields and "prompt" not in fields
