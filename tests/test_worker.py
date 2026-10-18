@@ -323,3 +323,34 @@ def test_looping_chunk_is_retranscribed_in_short_pieces(dirs, monkeypatch):
     segments = json.loads((jobstore.job_path(job["id"], jobs) / "transcript.json").read_text(encoding="utf-8"))["segments"]
     assert [s["text"] for s in segments] == ["pedaço 2", "pedaço 3", "pedaço 4"]
     assert [s["start"] for s in segments] == [0.5, 15.5, 30.5]
+
+
+def test_transient_403_on_media_is_retried_once(dirs, tmp_path, monkeypatch):
+    if shutil.which("yt-dlp") is None:
+        pytest.skip("yt-dlp not installed")
+    jobs, _box = dirs
+    site = tmp_path / "site"
+    site.mkdir()
+    make_clip(site / "clip.mp4", seconds=4)
+    server = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(site)))
+    server.RequestHandlerClass.log_message = lambda *a: None
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv("WATCH_MCP_TEST_ALLOW_HOSTS", "127.0.0.1")
+    real_run, downloads = worker.run, []
+
+    def flaky(argv, **kwargs):
+        if argv[0] == "yt-dlp" and "-o" in argv:
+            downloads.append(1)
+            if len(downloads) == 1:
+                return subprocess.CompletedProcess(argv, 1, "", "ERROR: unable to download video data: HTTP Error 403: Forbidden")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(worker, "run", flaky)
+    try:
+        job = new_job(jobs, value=f"http://127.0.0.1:{server.server_port}/clip.mp4", kind="url")
+        worker.process(job, root=jobs)
+    finally:
+        server.shutdown()
+    assert len(downloads) == 2
+    assert jobstore.load_job(job["id"], jobs)["state"] == "done"

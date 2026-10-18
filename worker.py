@@ -96,6 +96,7 @@ LOOP_MIN_BYTES = 120
 LOOP_PIECE_SECONDS = 30.0
 SHOWINFO_TS_RE = re.compile(r"pts_time:([0-9.]+)")
 DOWNLOAD_FORMAT = "bv*[height<=720]+ba/b[height<=720]/bv+ba/b"
+TRANSIENT_RE = re.compile(r"HTTP Error (403|429|5\d\d)")
 
 
 class JobFailed(Exception):
@@ -378,9 +379,17 @@ def download(job: Job, url: str) -> Path:
             shown = write_meta(job, info, secrets)
             job.update(stage="baixando", progress=2.0, title=shown.get("title"),
                        duration=info.get("duration") if _finite(info.get("duration")) else None)
-            got = run(["yt-dlp", *extra, "-N", "4", "-f", DOWNLOAD_FORMAT, "--merge-output-format", "mkv",
-                       "--no-playlist", "-o", str(work / "source.%(ext)s"), "--", url],
-                      timeout=job.remaining(), env=env, cwd=tmp, disk=(work, room))
+            for attempt in (1, 2):
+                got = run(["yt-dlp", *extra, "-N", "4", "-f", DOWNLOAD_FORMAT, "--merge-output-format", "mkv",
+                           "--no-playlist", "-o", str(work / "source.%(ext)s"), "--", url],
+                          timeout=job.remaining(), env=env, cwd=tmp, disk=(work, room))
+                # A media 403/5xx is often transient (signed CDN URLs); one fresh run
+                # re-extracts them. Same proxy, so the byte budget stays aggregate.
+                if got.returncode == 0 or attempt == 2 or proxy.exceeded or not TRANSIENT_RE.search(got.stderr):
+                    break
+                log(f"{job.id}: transient download error; retrying once")
+                for partial in work.glob("source.*"):
+                    partial.unlink()
             if proxy.exceeded:
                 if budget < MAX_DOWNLOAD_BYTES:
                     raise JobFailed(f"sem espaço no cache de trabalhos para o download "
