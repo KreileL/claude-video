@@ -96,19 +96,6 @@ def setting(name: str) -> str | None:
     return None
 
 
-def openai_endpoint() -> str:
-    """Transcription endpoint — the local base URL when one is configured."""
-    base = setting(BASE_URL_KEY)
-    if not base:
-        return OPENAI_ENDPOINT
-    return f"{base.rstrip('/')}/audio/transcriptions"
-
-
-def openai_model() -> str:
-    """Model id. Local servers use their own ids, not OpenAI's `whisper-1`."""
-    return setting(MODEL_KEY) or OPENAI_MODEL
-
-
 def local_endpoint() -> str:
     """Local server endpoint: explicit URL, else <base>/audio/transcriptions,
     else the compose-stack default."""
@@ -197,7 +184,8 @@ def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, 
 
     A configured local server outranks a hosted key: it costs nothing, keeps the
     audio on the machine, and having set it is an explicit choice. `--whisper
-    groq` is the escape hatch when both are configured. Local servers generally
+    groq|openai` is the escape hatch when both are configured, and then goes to
+    that hosted API itself, never to the local endpoint. Local servers generally
     ignore Authorization, so a placeholder stands in for the key rather than
     blocking on a credential that carries no meaning. OPENAI_API_KEY is never
     reused here — the base URL can name any host, and the real credential must
@@ -208,7 +196,7 @@ def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, 
     "use the default endpoint" (DEFAULT_LOCAL_URL), so it still returns local.
     """
     local_configured = setting(URL_KEY) or setting(BASE_URL_KEY)
-    if preferred == "local" or (local_configured and preferred in (None, "openai")):
+    if preferred == "local" or (local_configured and preferred is None):
         return "local", setting(API_KEY_KEY) or LOCAL_NO_KEY
 
     candidates = (("GROQ_API_KEY", "groq"), ("OPENAI_API_KEY", "openai"))
@@ -526,7 +514,8 @@ def _transcribe_file(backend: str, api_key: str, audio_path: Path) -> list[dict]
             audio_path,
         )
     elif backend == "openai":
-        response = _post_whisper(openai_endpoint(), api_key, openai_model(), audio_path)
+        # Always OpenAI itself: local overrides must never redirect the real key.
+        response = _post_whisper(OPENAI_ENDPOINT, api_key, OPENAI_MODEL, audio_path)
     else:
         raise SystemExit(f"Unknown whisper backend: {backend}")
     return _segments_from_response(response)

@@ -154,3 +154,27 @@ def test_server_500_retries_then_exits(monkeypatch, server, audio):
     with pytest.raises(SystemExit):
         whisper._post_whisper(server["url"], None, "m", audio)
     assert len(server["requests"]) == whisper.MAX_ATTEMPTS
+
+
+def test_explicit_openai_is_honoured_even_with_local_server(monkeypatch):
+    monkeypatch.setenv("WATCH_WHISPER_BASE_URL", "http://local.test:1234/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-synthetic")
+    assert whisper.load_api_key("openai") == ("openai", "sk-synthetic")
+
+
+def test_openai_backend_never_posts_to_local_endpoint(monkeypatch, tmp_path):
+    # The OpenAI key must only ever travel to OpenAI, whatever local overrides are set.
+    monkeypatch.setenv("WATCH_WHISPER_BASE_URL", "http://local.test:1234/v1")
+    monkeypatch.setenv("WATCH_WHISPER_URL", "http://local.test:1234/v1/audio/transcriptions")
+    monkeypatch.setenv("WATCH_WHISPER_MODEL", "Systran/faster-whisper-small")
+    seen = {}
+
+    def fake_post(endpoint, api_key, model, audio_path):
+        seen.update(endpoint=endpoint, model=model)
+        return {"segments": []}
+
+    monkeypatch.setattr(whisper, "_post_whisper", fake_post)
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"x")
+    whisper._transcribe_file("openai", "sk-synthetic", audio)
+    assert seen == {"endpoint": whisper.OPENAI_ENDPOINT, "model": whisper.OPENAI_MODEL}
