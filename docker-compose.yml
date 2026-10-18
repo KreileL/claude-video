@@ -108,7 +108,8 @@ services:
   watch-worker:
     # v2: the job queue on watch-mcp-jobs (the stdio server only enqueues and reads).
     image: watch-mcp:v2
-    build: .
+    # No build key: this branch's Dockerfile builds v3, so `up --build` must not
+    # retag it as v2 (rebuild v2 from the v2-mcp tag if ever needed).
     container_name: watch-mcp-worker
     restart: unless-stopped
     init: true
