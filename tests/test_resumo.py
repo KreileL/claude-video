@@ -358,3 +358,15 @@ def test_p2_abandoned_calls_are_capped(keys, monkeypatch):
         assert len(calls) == resumo.MAX_ABANDONED
     finally:
         release.set()
+
+
+def test_p3_a_call_refused_by_the_cap_is_not_counted(keys, monkeypatch):
+    monkeypatch.setattr(resumo, "_ABANDONED", [threading.Thread()] * 0)
+    alive = [threading.Thread(target=threading.Event().wait, args=(2,), daemon=True) for _ in range(resumo.MAX_ABANDONED)]
+    for t in alive:
+        t.start()
+    monkeypatch.setattr(resumo, "_ABANDONED", list(alive))
+    before = resumo.CALLS["gemini"]
+    with pytest.raises(resumo.ResumoError, match="ainda em andamento"):
+        run("http://127.0.0.1:9")
+    assert resumo.CALLS["gemini"] == before

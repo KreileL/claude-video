@@ -426,11 +426,12 @@ def render_index(info: dict) -> str:
     export_id = info.get("export_id")
     if export_id is not None and not (isinstance(export_id, str) and re.fullmatch(r"[0-9a-f]{16}", export_id)):
         raise EntradaError("export_id inválido")
-    fm = ["---", f"title: {_q(title)}", "tipo: entrada", "subtipo: video", "status: rascunho",
-          f"origem: {_q(origem)}", f"job_id: {_q(job_id)}"]
+    # Identifiers first: the worker recognizes its own folder from the first bytes after a crash.
+    fm = ["---", f"job_id: {_q(job_id)}"]
     if export_id:
-        fm.append(f"export_id: {_q(export_id)}")  # lets the worker recognize its own folder after a crash
-    fm += [
+        fm.append(f"export_id: {_q(export_id)}")
+    fm += [f"title: {_q(title)}", "tipo: entrada", "subtipo: video", "status: rascunho",
+           f"origem: {_q(origem)}",
           f"data_processamento: {date}", f"data_criacao: {date}"]
     if dur is not None:
         fm.append(f"duracao: {_q(hms(dur))}")

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -76,8 +77,9 @@ class Api:
         req = urllib.request.Request(url, data=json.dumps(params).encode("utf-8"), method="POST",
                                      headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
+            body = json.loads(_bounded(lambda: _read(req, timeout), timeout * 1.2 + 2).decode("utf-8"))
+        except _Late:
+            raise TelegramError(f"tempo esgotado em {method}") from None
         except urllib.error.HTTPError as exc:
             raise TelegramError(redact(f"Telegram respondeu HTTP {exc.code} em {method}", self.token),
                                 status=exc.code) from None
@@ -97,6 +99,38 @@ class Api:
     def send(self, chat_id: int, text: str) -> None:
         self.call("sendMessage", {"chat_id": chat_id, "text": text,
                                   "disable_web_page_preview": True}, 20)
+
+
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+
+
+class _Late(Exception):
+    pass
+
+
+def _read(req: urllib.request.Request, timeout: float) -> bytes:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read(MAX_RESPONSE_BYTES)
+
+
+def _bounded(call, seconds: float):
+    """call() with a TOTAL time limit (a socket timeout is per operation)."""
+    box: dict = {}
+
+    def target():
+        try:
+            box["value"] = call()
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the caller
+            box["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(max(0.0, seconds))
+    if thread.is_alive():
+        raise _Late()
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
 
 
 def is_allowed(update: dict, allowed: int = ALLOWED_USER) -> bool:

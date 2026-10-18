@@ -188,9 +188,12 @@ def _post(url: str, headers: dict, body: dict, name: str, key: str,
     timeout = _timeout(deadline, key)
     headers = {**headers, "Content-Type": "application/json", "User-Agent": "watch-resumo/1.0"}
     request = Request(url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
-    CALLS[name] += 1
+    def start():
+        CALLS[name] += 1  # counted when the request really starts (not when refused)
+        return _fetch(request, timeout)
+
     try:
-        status, raw = _bounded(lambda: _fetch(request, timeout), timeout)
+        status, raw = _bounded(start, timeout)
     except _Late:
         raise _fail("tempo esgotado", key, transient=True) from None
     except _Crowded:

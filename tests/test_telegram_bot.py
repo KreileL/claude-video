@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -386,3 +387,34 @@ def test_p2_bad_status_line_never_carries_the_token():
         api.call("getUpdates", {}, 5)
     assert TOKEN not in str(err.value) and TOKEN.split(":")[1] not in str(err.value)
     srv.close()
+
+
+def test_p3_a_trickling_answer_respects_a_total_deadline():
+    class Trickle(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            body = json.dumps({"ok": True, "result": []}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            for byte in body:
+                try:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(0.2)  # under the per-operation timeout, over the total
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        api = tb.Api(TOKEN, base=f"http://127.0.0.1:{server.server_port}")
+        start = time.monotonic()
+        with pytest.raises(tb.TelegramError, match="tempo esgotado"):
+            api.call("getUpdates", {}, 0.5)
+        assert time.monotonic() - start < 4.0  # total = 0.5 * 1.2 + 2 s
+    finally:
+        server.shutdown()
