@@ -437,7 +437,7 @@ docker stop watch-mcp-worker                       # nunca dois workers na mesma
 docker compose -p watch-mcp --profile v3 up -d watch-worker-v3 watch-telegram
 ```
 
-Segredos (Docker secrets, lidos de `%USERPROFILE%\.config\watch\secrets\`): `gemini-api-key.txt` (só o worker) e `telegram-bot-token.txt` (só o bot). Os cookies do worker continuam como na v2. O caminho do cofre pode ser trocado com `WATCH_ENTRADA_HOST_DIR`.
+Segredos (Docker secrets, lidos de `%USERPROFILE%\.config\watch\secrets-v3\`, ou de `WATCH_SECRETS_V3_DIR`): `gemini-api-key.txt` (só o worker) e `telegram-bot-token.txt` (só o bot). O `cookies.txt` continua em `secrets\`, como na v2 (o rollback depende disso), e o bind `/secrets` do worker mostra só ele. O caminho do cofre pode ser trocado com `WATCH_ENTRADA_HOST_DIR`.
 
 ### Exportar um trabalho antigo
 

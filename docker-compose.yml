@@ -189,7 +189,7 @@ services:
         source: ${WATCH_INBOX_DIR:-D:/Inbox}
         target: /inbox
         read_only: true
-      # Cookies exactly as in v2 (no wider access).
+      # Cookies exactly as in v2; the v3 secrets are in secrets-v3, not here.
       - type: bind
         source: ${WATCH_SECRETS_DIR:-${USERPROFILE}/.config/watch/secrets}
         target: /secrets
@@ -255,8 +255,10 @@ networks:
     # "confirm you're not a bot", not its IPv6. netguard's proxy tries IPv6 first.
     enable_ipv6: true
 
+# v3 secrets live apart from the v2 folder (which keeps only cookies.txt and is
+# bind-mounted at /secrets), so that bind shows the cookies and nothing else.
 secrets:
   gemini_api_key:
-    file: ${WATCH_SECRETS_DIR:-${USERPROFILE}/.config/watch/secrets}/gemini-api-key.txt
+    file: ${WATCH_SECRETS_V3_DIR:-${USERPROFILE}/.config/watch/secrets-v3}/gemini-api-key.txt
   telegram_bot_token:
-    file: ${WATCH_SECRETS_DIR:-${USERPROFILE}/.config/watch/secrets}/telegram-bot-token.txt
+    file: ${WATCH_SECRETS_V3_DIR:-${USERPROFILE}/.config/watch/secrets-v3}/telegram-bot-token.txt

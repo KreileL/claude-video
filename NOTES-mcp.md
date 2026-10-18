@@ -770,7 +770,7 @@ Código da v1: tag `v1-mcp` (16dc2ed). Imagem: `watch-mcp:latest`, também marca
 | Archived = `state: "archived"` (not a flag on `done`) | The v2 cleanup already skips any state other than done/failed: protection also holds on rollback. |
 | Summary before publish; late summary as `Resumo.md` (or a new folder if the user moved the original) | The simplest form of "create-only". |
 | Gemini `gemini-3.8-flash` | Stable, newest Flash, 1,048,576-token input, image input (ai.google.dev, 2026-10-18). A 2:36 film transcript fits one call. |
-| Worker keeps v2's `/secrets` bind for cookies; Gemini key as a Docker secret; bot gets only the token | "No wider cookie access than v2". Side effect: the worker's `/secrets` bind also shows the other files of that folder (the worker never reads them). |
+| Worker keeps v2's `/secrets` bind for cookies; Gemini key and bot token as Docker secrets from `secrets-v3\` | "No wider cookie access than v2". The v3 secrets were moved out of `secrets\` (user's request, after the sprint) so that bind shows only `cookies.txt`; `cookies.txt` stays put for the v2 rollback. |
 | Telegram links with `language="auto"` | An English reel forced to `pt` came out as a bad translation in acceptance test 2. MCP keeps `pt` (v2 decision). |
 | `watch-worker` (v2) lost `build: .` | This branch's Dockerfile builds v3; `up --build` must not retag it as v2. Config hash unchanged (025d2091…), so no recreation. |
 
