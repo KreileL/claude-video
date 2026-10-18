@@ -222,10 +222,23 @@ def _rename_noreplace(src: str, dst: str) -> None:
                 raise FileExistsError(err, os.strerror(err), dst)
             if err not in (errno.EINVAL, errno.ENOSYS):
                 raise OSError(err, os.strerror(err), dst)
-    # Fallback: check then rename (POSIX rename could replace an empty dir; Windows never does).
-    if os.path.lexists(dst):
-        raise FileExistsError(errno.EEXIST, "exists", dst)
-    os.rename(src, dst)
+    if os.name == "nt":  # Windows rename never replaces an existing target
+        if os.path.lexists(dst):
+            raise FileExistsError(errno.EEXIST, "exists", dst)
+        os.rename(src, dst)
+        return
+    # No RENAME_NOREPLACE (Docker Desktop's Windows bind mounts answer EINVAL), and a
+    # plain POSIX rename there DOES replace an empty directory. Reserve the name with
+    # an exclusive mkdir (atomic), then rename over that reservation, which is ours.
+    os.mkdir(dst)  # FileExistsError: someone else's name, try the next suffix
+    try:
+        os.rename(src, dst)
+    except OSError:
+        try:
+            os.rmdir(dst)  # only succeeds while our reservation is still empty
+        except OSError:
+            pass
+        raise
 
 
 def publish(root: Path | None, staged: Path, base_name: str) -> str:

@@ -330,3 +330,22 @@ def test_pick_key_frames_small_and_malformed():
     assert entrada.pick_key_frames([]) == []
     twelve = [{"t": i * 10, "file": f"f_{i:05d}.jpg", "kind": "grid"} for i in range(12)]
     assert 10 <= len(entrada.pick_key_frames(twelve)) <= 12
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX rename semantics (runs in the Linux suite)")
+def test_fallback_never_replaces_an_empty_dir_created_in_the_race_window(tmp_path, monkeypatch):
+    # Docker Desktop's Windows bind mounts answer EINVAL to RENAME_NOREPLACE, and a
+    # plain rename there replaces an empty directory: the name must be reserved first.
+    import ctypes
+    monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: (_ for _ in ()).throw(OSError("no renameat2")))
+    root = tmp_path / "entrada"
+    root.mkdir()
+    staged = entrada.staging(root, "a" * 32)
+    entrada.create_file(staged / "nota.md", "x")
+    base = entrada.folder_name("2026-10-18", "Título", "a" * 32)
+    (root / base).mkdir()  # someone else's empty folder, invisible to the pre-check below
+    monkeypatch.setattr(entrada.os.path, "lexists", lambda p: False)
+    final = entrada.publish(root, staged, base)
+    assert final == base + " (2)"
+    assert list((root / base).iterdir()) == []  # untouched
+    assert (root / final / "nota.md").read_text() == "x"
