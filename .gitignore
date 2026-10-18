@@ -18,3 +18,4 @@ htmlcov/
 # Codex review worktrees and output
 .codex/
 tests/bench/data/
+RELEASE-v2.md
