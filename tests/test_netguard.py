@@ -315,3 +315,54 @@ def test_proxy_falls_back_to_next_vetted_address(origin):
     res = fake_resolver({"multi.test": ["::1", "127.0.0.1"]})
     with EgressProxy(allow_hosts={"multi.test"}, resolver=res) as p:
         assert _get(p, f"http://multi.test:{origin.port}/") == "hello"
+
+
+class _NoLength(http.server.BaseHTTPRequestHandler):
+    """Streams 8 KiB with no Content-Length (what defeats yt-dlp's --max-filesize)."""
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        try:
+            self.wfile.write(b"Z" * 8192)
+        except OSError:
+            pass
+
+    def log_message(self, *a):
+        pass
+
+
+def test_proxy_byte_budget_is_hard_and_aggregate():
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _NoLength)
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    res = fake_resolver({"big.test": ["127.0.0.1"]})
+    try:
+        with EgressProxy(allow_hosts={"big.test"}, resolver=res, max_bytes=1024) as p:
+            got = b""
+            try:
+                with _opener(p).open(f"http://big.test:{srv.server_address[1]}/", timeout=5) as resp:
+                    got = resp.read()
+            except Exception:
+                pass
+            assert len(got) < 8192
+            assert p.exceeded
+            # Budget is per proxy, so a second connection is refused outright.
+            with pytest.raises(urllib.error.HTTPError) as ei:
+                _get(p, f"http://big.test:{srv.server_address[1]}/again")
+            assert ei.value.code == 403
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_proxy_without_budget_passes_everything():
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _NoLength)
+    threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    res = fake_resolver({"big.test": ["127.0.0.1"]})
+    try:
+        with EgressProxy(allow_hosts={"big.test"}, resolver=res) as p:
+            with _opener(p).open(f"http://big.test:{srv.server_address[1]}/", timeout=5) as resp:
+                assert len(resp.read()) == 8192
+            assert not p.exceeded
+    finally:
+        srv.shutdown()
+        srv.server_close()

@@ -133,11 +133,12 @@ def _reply(sock, code: int, reason: str, body: str = "") -> None:
         pass
 
 
-def _pipe(a: socket.socket, b: socket.socket, idle: float) -> None:
-    """Copy bytes both ways until either side closes or idle seconds pass."""
+def _pipe(client: socket.socket, upstream: socket.socket, idle: float, egress) -> None:
+    """Copy bytes both ways until either side closes, idle seconds pass, or the
+    proxy's download budget runs out (bytes from upstream count against it)."""
     sel = selectors.DefaultSelector()
-    sel.register(a, selectors.EVENT_READ, b)
-    sel.register(b, selectors.EVENT_READ, a)
+    sel.register(client, selectors.EVENT_READ, upstream)
+    sel.register(upstream, selectors.EVENT_READ, client)
     try:
         while True:
             events = sel.select(idle)
@@ -147,6 +148,8 @@ def _pipe(a: socket.socket, b: socket.socket, idle: float) -> None:
                 try:
                     data = key.fileobj.recv(65536)
                     if not data:
+                        return
+                    if key.fileobj is upstream and not egress.consume(len(data)):
                         return
                     key.data.sendall(data)
                 except OSError:
@@ -184,6 +187,8 @@ class _Handler(socketserver.BaseRequestHandler):
             head, rest = self._read_head(client)
             method, hostport, plan = self._parse(head)
             host, port, first_bytes = plan
+            if self.server.egress.exceeded:
+                raise BlockedURL("blocked: download budget exceeded")
             results = resolve_checked(host, port, allow_hosts=self.server.egress.allow_hosts,
                                       resolver=self.server.egress.resolver)
             upstream = self._connect(results)
@@ -207,7 +212,7 @@ class _Handler(socketserver.BaseRequestHandler):
                     upstream.sendall(first_bytes)
                 if rest:
                     upstream.sendall(rest)
-                _pipe(client, upstream, self.server.egress.idle_timeout)
+                _pipe(client, upstream, self.server.egress.idle_timeout, self.server.egress)
             except OSError:
                 pass
 
@@ -275,14 +280,33 @@ class _Server(socketserver.ThreadingTCPServer):
 
 
 class EgressProxy:
-    """Loopback-only HTTP forward proxy that refuses non-public destinations."""
+    """Loopback-only HTTP forward proxy that refuses non-public destinations.
 
-    def __init__(self, *, allow_hosts=None, resolver=socket.getaddrinfo, idle_timeout: float = 60.0):
+    `max_bytes` is a hard budget on bytes received from upstream, summed over
+    every connection: unlike yt-dlp's --max-filesize it does not depend on a
+    Content-Length header. Once spent, open tunnels are cut, new requests get
+    403, and `exceeded` is True.
+    """
+
+    def __init__(self, *, allow_hosts=None, resolver=socket.getaddrinfo, idle_timeout: float = 60.0,
+                 max_bytes: int | None = None):
         self.allow_hosts = allow_hosts
         self.resolver = resolver
         self.idle_timeout = idle_timeout
+        self.max_bytes = max_bytes
+        self.received = 0
+        self.exceeded = False
+        self._lock = threading.Lock()
         self._server = None
         self._thread = None
+
+    def consume(self, n: int) -> bool:
+        """Count n upstream bytes; False once the budget is exceeded."""
+        with self._lock:
+            self.received += n
+            if self.max_bytes is not None and self.received > self.max_bytes:
+                self.exceeded = True
+            return not self.exceeded
 
     def start(self) -> int:
         self._server = _Server(("127.0.0.1", 0), _Handler)
