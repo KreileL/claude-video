@@ -13,6 +13,8 @@ WHISPER_URL = "http://watch-whisper:8000/v1/audio/transcriptions"
 WHISPER_MODEL = "Systran/faster-whisper-small"
 # v2: new image, the background-job cache volume and the inbox (read-only).
 IMAGE_V2 = "watch-mcp:v2"
+# v2 has its own Whisper service (docker-compose.yml, watch-whisper-v2).
+WHISPER_URL_V2 = "http://watch-whisper-v2:8000/v1/audio/transcriptions"
 WHISPER_MODEL_V2 = "Systran/faster-whisper-small"
 JOBS_VOLUME = "watch-mcp-jobs"
 INBOX_DIR = "D:/Inbox"
@@ -26,7 +28,7 @@ def secrets_dir(home: Path | None = None) -> Path:
 
 
 def _args(home: Path | None, extra_env: dict[str, str] | None, *, image: str, model: str,
-          mounts: list[str]) -> list[str]:
+          mounts: list[str], whisper_url: str = WHISPER_URL) -> list[str]:
     # A directory mount, not the file: the config is static, and a missing
     # bind source would stop the server from starting. cookies.txt is optional
     # inside it. Forward slashes: --mount on Windows needs src=C:/...
@@ -34,7 +36,7 @@ def _args(home: Path | None, extra_env: dict[str, str] | None, *, image: str, mo
     args = [
         "run", "-i", "--rm", "--init",
         "--network", "watch-mcp-net",
-        "-e", f"WATCH_WHISPER_URL={WHISPER_URL}",
+        "-e", f"WATCH_WHISPER_URL={whisper_url}",
         "-e", f"WATCH_WHISPER_MODEL={model}",
         "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=1g",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -54,7 +56,7 @@ def docker_args(home: Path | None = None, extra_env: dict[str, str] | None = Non
 
 def docker_args_v2(home: Path | None = None, extra_env: dict[str, str] | None = None) -> list[str]:
     # The server only enqueues and reads jobs; the watch-worker service does the work.
-    return _args(home, extra_env, image=IMAGE_V2, model=WHISPER_MODEL_V2, mounts=[
+    return _args(home, extra_env, image=IMAGE_V2, model=WHISPER_MODEL_V2, whisper_url=WHISPER_URL_V2, mounts=[
         f"type=volume,src={JOBS_VOLUME},dst=/jobs",
         f"type=bind,src={INBOX_DIR},dst=/inbox,readonly",
     ])

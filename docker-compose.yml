@@ -55,6 +55,49 @@ services:
       retries: 3
       start_period: 60s
 
+  watch-whisper-v2:
+    # v2's own Whisper. One large pt-BR model left watch-whisper (4 GB) at its
+    # memory limit in the benchmark (cgroup memory.max hit ~39k times, ~3.5 GB of
+    # heap kept after unloading), so v2 never loads models into the v1 service.
+    # Same pinned image; the shared model volume is mounted read-only.
+    image: ghcr.io/speaches-ai/speaches:0.8.3-cpu@sha256:21e3df06d842fb7802ab470dd77c25f0e8c0d22950e8d8c6ae886e851af53ef8
+    container_name: watch-mcp-whisper-v2
+    restart: unless-stopped
+    user: "1000:1000"
+    environment:
+      WHISPER__TTL: "120"
+      WHISPER__INFERENCE_DEVICE: cpu
+      WHISPER__COMPUTE_TYPE: int8
+      WHISPER__CPU_THREADS: "8"
+      OMP_NUM_THREADS: "8"
+      ENABLE_UI: "false"
+      LOG_LEVEL: info
+      HF_HUB_DISABLE_XET: "1"
+      # Models come from the shared volume; this service never downloads.
+      HF_HUB_OFFLINE: "1"
+      # Fewer glibc arenas: less heap kept after a large model is unloaded.
+      MALLOC_ARENA_MAX: "2"
+    volumes:
+      - watch-mcp-models:/home/ubuntu/.cache/huggingface/hub:ro
+    networks:
+      - watch-mcp-net
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: 8
+    mem_limit: 8g
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
   watch-worker:
     # v2: the job queue on watch-mcp-jobs (the stdio server only enqueues and reads).
     image: watch-mcp:v2
@@ -65,7 +108,7 @@ services:
     entrypoint: ["python", "/app/worker.py"]
     user: "10001:10001"
     environment:
-      WATCH_WHISPER_URL: http://watch-whisper:8000/v1/audio/transcriptions
+      WATCH_WHISPER_URL: http://watch-whisper-v2:8000/v1/audio/transcriptions
       # A 5-minute chunk on CPU can take minutes with the larger models.
       WATCH_WHISPER_TIMEOUT: "1800"
       # Chosen by the pt-BR benchmark (NOTES-mcp.md, "v2").

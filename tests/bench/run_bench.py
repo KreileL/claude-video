@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -134,10 +135,24 @@ def unload_all(limit: float = 300.0) -> None:
         time.sleep(10)
 
 
-def transcribe(audio: Path, model: str, prompt: str | None) -> tuple[str, float]:
+def transcribe(audio: Path, model: str, prompt: str | None, pieces: float | None = None) -> tuple[str, float]:
+    """language="pt". With `pieces`, the audio is sent as consecutive pieces of
+    that many seconds, each a fresh request (distil models degrade past ~30 s
+    of conditioned decoding); the time includes every piece."""
     started = time.monotonic()
-    segments = whisper.transcribe_local(audio, model=model, language="pt", prompt=prompt)
-    return " ".join(s["text"] for s in segments), time.monotonic() - started
+    if not pieces:
+        segments = whisper.transcribe_local(audio, model=model, language="pt", prompt=prompt)
+        return " ".join(s["text"] for s in segments), time.monotonic() - started
+    folder = Path("/tmp") / f"pieces-{audio.stem}"
+    shutil.rmtree(folder, ignore_errors=True)
+    folder.mkdir(parents=True)
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(audio), "-f", "segment",
+                    "-segment_time", f"{pieces:g}", "-c", "copy", str(folder / "p%03d.mp3")], check=True)
+    texts = []
+    for piece in sorted(folder.glob("p*.mp3")):
+        segments = whisper.transcribe_local(piece, model=model, language="pt", prompt=prompt)
+        texts.append(" ".join(s["text"] for s in segments))
+    return " ".join(texts), time.monotonic() - started
 
 
 def score(clip: dict, hyp: str) -> dict:
@@ -157,31 +172,34 @@ def log_window(event: str, model: str) -> None:
         f.write(json.dumps({"t": time.time(), "event": event, "model": model}) + "\n")
 
 
-def run(models: list[str]) -> None:
+def run(models: list[str], pieces: float | None = None) -> None:
     RESULTS.mkdir(parents=True, exist_ok=True)
     for model in models:
-        out = RESULTS / f"{model.replace('/', '__')}.json"
+        suffix = f"__p{pieces:g}" if pieces else ""
+        out = RESULTS / f"{model.replace('/', '__')}{suffix}.json"
         records = json.loads(out.read_text(encoding="utf-8")) if out.exists() else []
         done = {(r["clip"], r["prompt_mode"]) for r in records}
         unload_all()
-        log_window("start", model)
+        label = model + (f" (pedaços de {pieces:g} s)" if pieces else "")
+        log_window("start", label)
         # Warm-up loads the model; its time is reported separately.
         _hyp, load_seconds = transcribe(TTS_DIR / "piper-faber.mp3", model, None)
         for clip in clips():
             for mode, prompt in prompts(clip).items():
                 if (clip["id"], mode) in done:
                     continue
-                hyp, seconds = transcribe(clip["audio"], model, prompt)
+                hyp, seconds = transcribe(clip["audio"], model, prompt, pieces)
                 audio_seconds = duration(clip["audio"])
                 records.append({
-                    "model": model, "clip": clip["id"], "kind": clip["kind"], "prompt_mode": mode,
+                    "model": label,
+                    "clip": clip["id"], "kind": clip["kind"], "prompt_mode": mode,
                     "audio_seconds": audio_seconds, "seconds": round(seconds, 2),
                     "seconds_per_audio_minute": round(seconds / audio_seconds * 60, 2),
                     "warmup_seconds": round(load_seconds, 2), "hyp": hyp, **score(clip, hyp),
                 })
                 out.write_text(json.dumps(records, ensure_ascii=False, indent=1), encoding="utf-8")
                 print(f"{model} {clip['id']} {mode}: wer={records[-1].get('wer')} {seconds:.0f}s", flush=True)
-        log_window("end", model)
+        log_window("end", label)
         unload_all()
 
 
@@ -211,6 +229,8 @@ if __name__ == "__main__":
         synthesize()
     elif command == "run":
         run(sys.argv[2:])
+    elif command == "run-pieces":  # run-pieces <seconds> <model>...
+        run(sys.argv[3:], pieces=float(sys.argv[2]))
     elif command == "refs":
         drafts()
     else:
