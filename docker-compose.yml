@@ -1,9 +1,14 @@
 # Local service stack for the watch MCP server. Always run as project "watch-mcp":
 #   docker compose -p watch-mcp up -d
 #
-# Only the Whisper server lives here. The MCP server itself is started on
-# demand by Claude Desktop (`docker run -i --rm ... watch-mcp:latest`) and joins
-# watch-mcp-net to reach it. No host ports are published.
+# watch-whisper is shared by v1 and v2; watch-worker (v2) processes background
+# jobs. The MCP servers themselves are started on demand by Claude Desktop
+# (`docker run -i --rm ... watch-mcp:latest` for "watch", `watch-mcp:v2` for
+# "watch-v2") and join watch-mcp-net. No host ports are published.
+#
+# v2 needs the image first (`docker build -t watch-mcp:v2 .`, or `up -d --build`).
+# Paths: WATCH_INBOX_DIR (default D:/Inbox) and WATCH_SECRETS_DIR (default
+# %USERPROFILE%/.config/watch/secrets) can be overridden in the environment.
 name: watch-mcp
 
 services:
@@ -50,9 +55,58 @@ services:
       retries: 3
       start_period: 60s
 
+  watch-worker:
+    # v2: the job queue on watch-mcp-jobs (the stdio server only enqueues and reads).
+    image: watch-mcp:v2
+    build: .
+    container_name: watch-mcp-worker
+    restart: unless-stopped
+    init: true
+    entrypoint: ["python", "/app/worker.py"]
+    user: "10001:10001"
+    environment:
+      WATCH_WHISPER_URL: http://watch-whisper:8000/v1/audio/transcriptions
+      # A 5-minute chunk on CPU can take minutes with the larger models.
+      WATCH_WHISPER_TIMEOUT: "1800"
+      # Chosen by the pt-BR benchmark (NOTES-mcp.md, "v2").
+      WATCH_MODEL_FAST: Systran/faster-whisper-small
+      WATCH_MODEL_ACCURATE: Systran/faster-whisper-medium
+      WATCH_PTBR_PROMPT: "1"
+      # Limits (defaults shown): 4 h of media, 4 GiB per download, 8 h per job,
+      # 7-day retention, 20 GiB for the whole cache.
+      WATCH_JOB_MAX_DURATION: "14400"
+      WATCH_JOB_MAX_DOWNLOAD_BYTES: "4294967296"
+      WATCH_JOB_TIMEOUT: "28800"
+      WATCH_JOB_TTL: "604800"
+      WATCH_JOBS_MAX_BYTES: "21474836480"
+    volumes:
+      - watch-mcp-jobs:/jobs
+      - type: bind
+        source: ${WATCH_INBOX_DIR:-D:/Inbox}
+        target: /inbox
+        read_only: true
+      - type: bind
+        source: ${WATCH_SECRETS_DIR:-${USERPROFILE}/.config/watch/secrets}
+        target: /secrets
+        read_only: true
+    networks:
+      - watch-mcp-net
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: 4
+    mem_limit: 3g
+    pids_limit: 256
+
 volumes:
   watch-mcp-models:
     name: watch-mcp-models
+  watch-mcp-jobs:
+    name: watch-mcp-jobs
 
 networks:
   watch-mcp-net:
