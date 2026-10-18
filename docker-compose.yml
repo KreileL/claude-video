@@ -9,6 +9,13 @@
 # v2 needs the image first (`docker build -t watch-mcp:v2 .`, or `up -d --build`).
 # Paths: WATCH_INBOX_DIR (default D:/Inbox) and WATCH_SECRETS_DIR (default
 # %USERPROFILE%/.config/watch/secrets) can be overridden in the environment.
+#
+# v3 (profile "v3"): watch-worker-v3 replaces watch-worker (never run both: two
+# workers on one queue; the v3 worker waits while another heartbeat is fresh)
+# and watch-telegram is the Telegram bot. Build `docker build -t watch-mcp:v3 .`,
+# then `docker stop watch-mcp-worker` and
+# `docker compose -p watch-mcp --profile v3 up -d watch-worker-v3 watch-telegram`.
+# WATCH_ENTRADA_HOST_DIR is the vault's "00 - Entrada" (the only vault path mounted).
 name: watch-mcp
 
 services:
@@ -144,6 +151,95 @@ services:
     mem_limit: 3g
     pids_limit: 256
 
+  watch-worker-v3:
+    # v3: the v2 worker plus post-processing (LLM summary, a folder per job in the
+    # Holocron's "00 - Entrada", archived jobs). Same limits and hardening as v2.
+    profiles: ["v3"]
+    image: watch-mcp:v3
+    build: .
+    container_name: watch-mcp-worker-v3
+    restart: unless-stopped
+    init: true
+    entrypoint: ["python", "/app/worker.py"]
+    user: "10001:10001"
+    environment:
+      WATCH_WHISPER_URL: http://watch-whisper-v2:8000/v1/audio/transcriptions
+      WATCH_WHISPER_TIMEOUT: "1800"
+      WATCH_MODEL_FAST: Systran/faster-whisper-small
+      WATCH_MODEL_ACCURATE: deepdml/faster-whisper-large-v3-turbo-ct2
+      WATCH_JOB_MAX_DURATION: "14400"
+      WATCH_JOB_MAX_DOWNLOAD_BYTES: "4294967296"
+      WATCH_JOB_TIMEOUT: "28800"
+      WATCH_JOB_TTL: "604800"
+      WATCH_JOBS_MAX_BYTES: "21474836480"
+      # Summary: gemini (default) | claude | none. Model checked on ai.google.dev.
+      WATCH_RESUMO_PROVIDER: gemini
+      WATCH_GEMINI_MODEL: gemini-3.8-flash
+      WATCH_GEMINI_KEY_FILE: /run/secrets/gemini_api_key
+      # 0 turns summaries off for local inbox files (they never leave the machine).
+      WATCH_RESUMO_CAIXA_ENTRADA: "1"
+      WATCH_ENTRADA_DIR: /entrada
+      WATCH_UTC_OFFSET_HOURS: "-3"
+    secrets:
+      - gemini_api_key
+    volumes:
+      - watch-mcp-jobs:/jobs
+      - type: bind
+        source: ${WATCH_INBOX_DIR:-D:/Inbox}
+        target: /inbox
+        read_only: true
+      # Cookies exactly as in v2 (no wider access).
+      - type: bind
+        source: ${WATCH_SECRETS_DIR:-${USERPROFILE}/.config/watch/secrets}
+        target: /secrets
+        read_only: true
+      # Only the vault's "00 - Entrada", read-write; nothing else of the vault.
+      - type: bind
+        source: ${WATCH_ENTRADA_HOST_DIR:-${USERPROFILE}/Documents/Projetos/Obsidian/00 - Entrada}
+        target: /entrada
+    networks:
+      - watch-mcp-net
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: 4
+    mem_limit: 3g
+    pids_limit: 256
+
+  watch-telegram:
+    # InstWhisperBot: long polling (outbound only, no webhook, no port). Enqueues
+    # through mcp_server.enqueue_analysis; no vault, no cookies, no inbox.
+    profiles: ["v3"]
+    image: watch-mcp:v3
+    container_name: watch-mcp-telegram
+    restart: unless-stopped
+    init: true
+    entrypoint: ["python", "/app/telegram_bot.py"]
+    user: "10001:10001"
+    environment:
+      WATCH_TELEGRAM_TOKEN_FILE: /run/secrets/telegram_bot_token
+      WATCH_TELEGRAM_ALLOWED_USER: "1779779810"
+    secrets:
+      - telegram_bot_token
+    volumes:
+      - watch-mcp-jobs:/jobs
+    networks:
+      - watch-mcp-net
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    cpus: 1
+    mem_limit: 512m
+    pids_limit: 64
+
 volumes:
   watch-mcp-models:
     name: watch-mcp-models
@@ -157,3 +253,9 @@ networks:
     # IPv6 egress: YouTube throttles this line's shared (CGNAT) IPv4 with 429 /
     # "confirm you're not a bot", not its IPv6. netguard's proxy tries IPv6 first.
     enable_ipv6: true
+
+secrets:
+  gemini_api_key:
+    file: ${WATCH_SECRETS_DIR:-${USERPROFILE}/.config/watch/secrets}/gemini-api-key.txt
+  telegram_bot_token:
+    file: ${WATCH_SECRETS_DIR:-${USERPROFILE}/.config/watch/secrets}/telegram-bot-token.txt
