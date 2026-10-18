@@ -76,3 +76,18 @@ def test_download_url_requests_original_and_english(monkeypatch, tmp_path):
     with pytest.raises(SystemExit):
         download.download_url(URL, tmp_path / "download")
     _assert_original_and_english(_sub_langs(calls[0]))
+
+
+def test_pick_subtitle_matches_video_language_among_dubbed_orig_tracks(tmp_path):
+    # AI-dubbed videos expose one *-orig track per dubbed language; sort order
+    # would pick en-US-orig. The video's reported language must win.
+    for name in ("video.en-US-orig.vtt", "video.es-US-orig.vtt", "video.pt-orig.vtt", "video.en.vtt"):
+        (tmp_path / name).write_text("WEBVTT\n", encoding="utf-8")
+    (tmp_path / "video.info.json").write_text('{"language": "pt-BR"}', encoding="utf-8")
+    assert download._pick_subtitle(tmp_path).name == "video.pt-orig.vtt"
+
+
+def test_pick_subtitle_without_language_keeps_first_orig(tmp_path):
+    for name in ("video.en-US-orig.vtt", "video.pt-orig.vtt"):
+        (tmp_path / name).write_text("WEBVTT\n", encoding="utf-8")
+    assert download._pick_subtitle(tmp_path).name == "video.en-US-orig.vtt"

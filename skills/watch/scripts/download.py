@@ -41,15 +41,51 @@ def resolve_local(path: str) -> dict:
     }
 
 
+def _subtitle_lang(path: Path) -> str:
+    """The language token of a `video.<lang>.vtt` file, lowercased.
+
+    "video.pt-orig.vtt" -> "pt-orig";  "video.en-US.vtt" -> "en-us"
+    """
+    parts = path.name.split(".")
+    return parts[1].lower() if len(parts) >= 3 else ""
+
+
+def _video_language(out_dir: Path) -> str | None:
+    """The source language yt-dlp reported for the video itself, e.g. "pt-BR"."""
+    info = out_dir / "video.info.json"
+    if not info.exists():
+        return None
+    try:
+        return (json.loads(info.read_text(encoding="utf-8")) or {}).get("language")
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
 def _pick_subtitle(out_dir: Path) -> Path | None:
     candidates = sorted(out_dir.glob("video*.vtt"))
     if not candidates:
         return None
+
     # Original-language captions beat YouTube's machine translation, so take an
     # *-orig track first and only fall back to English.
     original = [c for c in candidates if "-orig." in c.name]
     if original:
+        # A video carrying YouTube's AI dubbing exposes one *-orig track per
+        # dubbed language (en-US-orig, es-US-orig, pt-orig...), so "the -orig
+        # one" is ambiguous and picking by sort order silently prefers English —
+        # handing back the very machine translation this branch exists to avoid.
+        # Match the language the extractor reported for the video itself.
+        lang = (_video_language(out_dir) or "").lower()
+        if lang:
+            base = lang.split("-")[0]
+            for c in original:
+                if _subtitle_lang(c).removesuffix("-orig") == lang:
+                    return c
+            for c in original:
+                if _subtitle_lang(c).removesuffix("-orig").split("-")[0] == base:
+                    return c
         return original[0]
+
     preferred = [
         c for c in candidates
         if any(marker in c.name for marker in (".en.", ".en-US.", ".en-GB."))
