@@ -815,6 +815,6 @@ Reports: `.codex/review-mcp-v3-pass{1..5}.md` (not versioned). Every fix has a r
 
 - Production unchanged: Desktop `watch` → `watch-mcp:v2`; `watch-mcp-worker` (v2) running; v2 compose hashes unchanged.
 - Images: `watch-mcp:v3` built; `v2`, `latest`, `v1` untouched.
-- Test stack still running (no restart policy): `watch-mcp-v3test-worker` (volume `watch-mcp-v3test-jobs`, real `00 - Entrada`) and `watch-mcp-v3test-telegram2` (the bot). `watch-mcp-v3test-telegram` is stopped (removal refused by the permission classifier).
+- Test stack stopped, not removed: `watch-mcp-v3test-telegram2` and `watch-mcp-v3test-telegram` (removal refused by the permission classifier); the test worker was removed by the final e2e run. Throwaway volume `watch-mcp-v3test-jobs` kept (the user decides).
 - In the vault, besides the film note: the notes of acceptance 2 and 3, plus the incident's three re-created test folders and two redundant `Resumo.md` (left for the user).
 - Promotion steps when decided: README "MCP local v3" → "Subir"; Desktop entry from `entry_v3()`; then merge `mcp-v3` → `mcp-local` (ff-only), tag `v3-mcp`, release text in `RELEASE-v3.md`.
