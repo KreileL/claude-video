@@ -158,6 +158,8 @@ def try_summary(job: dict, mat: dict, root: Path | None) -> str | None:
             frames.append((f["t"], data))
     attempts = int(jobstore.as_number(job.get("resumo_attempts"))) + 1
     duration = jobstore.as_number(job.get("duration")) or None
+    before = sum(resumo.CALLS.values())  # real HTTP calls only (a missing key makes none)
+    calls = int(jobstore.as_number(job.get("resumo_calls")))
     try:
         result = resumo.summarize(mat["segments"], title=mat["title"], duration=duration, frames=frames,
                                   deadline=time.monotonic() + SUMMARY_TIMEOUT)
@@ -165,21 +167,21 @@ def try_summary(job: dict, mat: dict, root: Path | None) -> str | None:
         jobstore.update_job(job["id"], root, resumo="desligado")
         return None
     except resumo.ResumoError as exc:
-        calls = int(jobstore.as_number(job.get("resumo_calls")))
+        calls += sum(resumo.CALLS.values()) - before
         if not exc.transient and attempts >= PERMANENT_TRIES:
             jobstore.update_job(job["id"], root, resumo="erro", resumo_error=str(exc)[:300],
-                                resumo_attempts=attempts, resumo_next=None, resumo_calls=calls + 1)
+                                resumo_attempts=attempts, resumo_next=None, resumo_calls=calls)
         else:
             wait = _backoff(attempts, RETRY_FIRST, RETRY_MAX)
             jobstore.update_job(job["id"], root, resumo="pendente", resumo_error=str(exc)[:300],
-                                resumo_attempts=attempts, resumo_next=time.time() + wait, resumo_calls=calls + 1)
+                                resumo_attempts=attempts, resumo_next=time.time() + wait, resumo_calls=calls)
         log(f"{job['id']}: resumo falhou ({exc}); tentativa {attempts}")
         return None
     jobstore.write_json_atomic(mat["dir"] / SUMMARY_FILE, {
         "text": result.text, "provider": result.provider, "model": result.model, "at": time.time()})
     jobstore.update_job(job["id"], root, resumo="ok", resumo_error=None, resumo_next=None,
                         resumo_attempts=attempts, resumo_model=f"{result.provider}:{result.model}",
-                        resumo_calls=int(jobstore.as_number(job.get("resumo_calls"))) + result.calls)
+                        resumo_calls=calls + result.calls)
     log(f"{job['id']}: resumo ok ({result.calls} chamada(s) ao {result.provider})")
     return result.text
 

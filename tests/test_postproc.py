@@ -282,3 +282,22 @@ def test_legacy_done_jobs_are_not_exported_by_themselves(env):
     jobstore.write_json_atomic(jobs / jid / "job.json", job)
     assert postproc.retry_due(now=time.time() + 10**6) == 0
     assert not [p for p in vault.iterdir() if not p.name.startswith(".")]
+
+
+def test_call_count_records_only_real_http_calls(env, monkeypatch):
+    jobs, vault, _ = env
+    jid = done_job(jobs)
+
+    def no_key(segments, **kw):
+        raise resumo.ResumoError("chave do gemini ausente", transient=True)  # no HTTP call made
+
+    def quota(segments, **kw):
+        resumo.CALLS["gemini"] += 1
+        raise resumo.ResumoError("limite de uso atingido (HTTP 429)", transient=True)
+
+    monkeypatch.setattr(resumo, "summarize", no_key)
+    postproc.finish(jid)
+    assert jobstore.load_job(jid, jobs)["resumo_calls"] == 0
+    monkeypatch.setattr(resumo, "summarize", quota)
+    postproc.retry_due(now=time.time() + 10**6)
+    assert jobstore.load_job(jid, jobs)["resumo_calls"] == 1
