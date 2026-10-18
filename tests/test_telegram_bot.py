@@ -338,3 +338,51 @@ def test_links_from_telegram_use_language_detection_and_hide_internal_errors():
     with pytest.raises(RuntimeError) as err:
         enqueue("https://x/bug")
     assert "segredo" not in str(err.value)
+
+
+def test_p2_ready_job_is_tracked_so_a_failed_reply_is_retried(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobstore, "JOBS_DIR", tmp_path)
+    job = jobstore.create_job({"source": {"kind": "url", "value": "https://x"}}, root=tmp_path)
+    jobstore.update_job(job["id"], tmp_path, state="archived", entrada_folder="2026-10-18 - X (abcdef)")
+    outbox, fail = [], {"on": True}
+
+    class Api:
+        token = TOKEN
+
+        def send(self, chat_id, text):
+            if fail["on"]:
+                raise tb.TelegramError("Telegram respondeu HTTP 503 em sendMessage", status=503)
+            outbox.append(text)
+
+    state = {"offset": None, "pending": []}
+    update = {"update_id": 1, "message": {"chat": {"id": tb.ALLOWED_USER, "type": "private"},
+                                          "from": {"id": tb.ALLOWED_USER, "is_bot": False},
+                                          "text": "https://x"}}
+    tb.handle_update(update, api=Api(), state=state,
+                     enqueue=lambda url: (jobstore.load_job(job["id"], tmp_path), True))
+    tb.check_pending(api=Api(), state=state, root=tmp_path)
+    assert len(state["pending"]) == 1  # the reply failed: still tracked
+    fail["on"] = False
+    tb.check_pending(api=Api(), state=state, root=tmp_path)
+    assert state["pending"] == [] and outbox == ["Pronto — nota em 00 - Entrada/2026-10-18 - X (abcdef)"]
+
+
+def test_p2_bad_status_line_never_carries_the_token():
+    import socket
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def serve():
+        conn, _ = srv.accept()
+        request = conn.recv(65536).split(b"\r\n")[0]  # "POST /bot<TOKEN>/getUpdates HTTP/1.1"
+        conn.sendall(b"GARBAGE " + request + b"\r\n\r\n")
+        conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    api = tb.Api(TOKEN, base=f"http://127.0.0.1:{srv.getsockname()[1]}")
+    with pytest.raises(tb.TelegramError) as err:
+        api.call("getUpdates", {}, 5)
+    assert TOKEN not in str(err.value) and TOKEN.split(":")[1] not in str(err.value)
+    srv.close()

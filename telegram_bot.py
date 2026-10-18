@@ -13,6 +13,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from http.client import HTTPException
 from pathlib import Path
 from typing import Callable
 
@@ -80,8 +81,10 @@ class Api:
         except urllib.error.HTTPError as exc:
             raise TelegramError(redact(f"Telegram respondeu HTTP {exc.code} em {method}", self.token),
                                 status=exc.code) from None
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, OSError, ValueError, HTTPException) as exc:
             raise TelegramError(redact(f"falha de rede em {method}: {type(exc).__name__}", self.token)) from None
+        except Exception as exc:  # noqa: BLE001 - remote content (e.g. a bad status line) may echo the URL
+            raise TelegramError(f"resposta inválida em {method}: {type(exc).__name__}") from None
         if not isinstance(body, dict) or not body.get("ok"):
             raise TelegramError(f"Telegram recusou {method}")
         return body.get("result")
@@ -220,7 +223,10 @@ def handle_update(update: dict, *, api: Api, state: dict,
             _reply(api, chat_id, "Não consegui enfileirar: " + redact(str(exc), api.token)[:300])
             continue
         if _is_ready(job):
-            _reply(api, chat_id, _ready_text(job))
+            # Tracked like any job: check_pending sends "Pronto" and retries if sending fails.
+            if not any(p["job_id"] == job["id"] for p in state["pending"]):
+                state["pending"].append({"job_id": job["id"], "chat_id": chat_id,
+                                         "short": short, "since": time.time()})
             continue
         # Track first: the "ready" message must come even if this reply fails.
         if not any(p["job_id"] == job["id"] for p in state["pending"]):
@@ -232,18 +238,30 @@ def handle_update(update: dict, *, api: Api, state: dict,
 
 def check_pending(*, api: Api, state: dict, root: Path | None = None) -> None:
     keep = []
+
+    def sent(chat_id, text) -> bool:
+        try:
+            api.send(chat_id, text)
+            return True
+        except TelegramError as exc:  # keep the entry: retried on the next check
+            _log(f"aviso não enviado: {exc}", api.token)
+            return False
+
     for p in state.get("pending", []):
         chat_id, short = p.get("chat_id"), p.get("short", "?")
         job = _job_state(p["job_id"], root)
         if job is None:
-            api.send(chat_id, f"Trabalho {short} não encontrado.")
+            if not sent(chat_id, f"Trabalho {short} não encontrado."):
+                keep.append(p)
             continue
         if _is_ready(job):
-            api.send(chat_id, _ready_text(job))
+            if not sent(chat_id, _ready_text(job)):
+                keep.append(p)
             continue
         if job.get("state") == "failed":
             err = str(job.get("error") or "erro desconhecido").splitlines() or [""]
-            api.send(chat_id, f"Falhou — {short}: {redact(err[0], api.token)[:300]}")
+            if not sent(chat_id, f"Falhou — {short}: {redact(err[0], api.token)[:300]}"):
+                keep.append(p)
             continue
         if job.get("state") in ("done", "archived") and job.get("export") == "pendente" \
                 and not p.get("warned"):
@@ -280,6 +298,11 @@ def run(*, enqueue: Callable[[str], tuple[dict, bool]], api: Api | None = None,
         except TelegramError as exc:
             _log(f"erro de rede: {exc}", api.token)
             sleep(30 if exc.status == 409 else backoff)
+            backoff = min(backoff * 2, 60.0)
+            continue
+        except Exception as exc:  # noqa: BLE001 - never a traceback with remote content
+            _log(f"erro inesperado em getUpdates: {type(exc).__name__}", api.token)
+            sleep(backoff)
             backoff = min(backoff * 2, 60.0)
             continue
         backoff = 1.0
