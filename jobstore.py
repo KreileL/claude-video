@@ -96,8 +96,17 @@ def create_job(fields: dict, root: Path | None = None) -> dict:
     return job
 
 
+def is_link(path: Path) -> bool:
+    """Symlink, or a Windows junction (development only)."""
+    return os.path.islink(path) or bool(getattr(os.path, "isjunction", lambda _p: False)(path))
+
+
 def load_job(job_id: str, root: Path | None = None) -> dict:
-    job = read_json(job_path(job_id, root) / "job.json")
+    path = job_path(job_id, root)
+    # A job is a real directory with a real job.json: links could point anywhere.
+    if is_link(path) or is_link(path / "job.json"):
+        raise JobError("trabalho não encontrado")
+    job = read_json(path / "job.json")
     if job is None or job.get("id") != job_id:
         raise JobError("trabalho não encontrado")
     return job
@@ -119,7 +128,7 @@ def _scan(root: Path | None) -> list[tuple[str, os.DirEntry]]:
         with os.scandir(_root(root)) as it:
             for entry in it:
                 try:
-                    if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                    if entry.is_symlink() or is_link(Path(entry.path)) or not entry.is_dir(follow_symlinks=False):
                         continue
                 except OSError:
                     continue

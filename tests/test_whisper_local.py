@@ -206,3 +206,16 @@ def test_transcribe_local_omits_empty_options(server, audio, monkeypatch):
     whisper.transcribe_local(audio, model="m-x")
     fields = _form_fields(server["requests"][0]["body"])
     assert "language" not in fields and "prompt" not in fields
+
+
+def test_transcribe_local_respects_a_deadline(server, audio, monkeypatch):
+    import time
+    monkeypatch.setenv("WATCH_WHISPER_URL", server["url"])
+    server["status"] = 500  # every attempt fails and would normally back off and retry
+    monkeypatch.setattr(whisper, "RETRY_BASE_DELAY", 5.0)
+    started = time.monotonic()
+    with pytest.raises(SystemExit):
+        whisper.transcribe_local(audio, model="m", deadline=time.monotonic() + 1.0)
+    assert time.monotonic() - started < 3.0  # no 5 s backoff past the deadline
+    with pytest.raises(SystemExit, match="deadline"):
+        whisper.transcribe_local(audio, model="m", deadline=time.monotonic() - 1.0)

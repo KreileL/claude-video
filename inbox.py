@@ -142,7 +142,7 @@ def input_args(demuxer: str | None = None) -> list[str]:
     return args + (["-f", demuxer] if demuxer else [])
 
 
-def probe(path: str, pass_fds: tuple[int, ...] = ()) -> dict:
+def probe(path: str, pass_fds: tuple[int, ...] = (), timeout: float = 120.0) -> dict:
     """ffprobe ``path`` and verify it is real audio/video in an allowed container."""
     invalid = InboxError("o arquivo não é um vídeo/áudio válido")
     argv = ["ffprobe", "-v", "error", *input_args(),
@@ -151,7 +151,7 @@ def probe(path: str, pass_fds: tuple[int, ...] = ()) -> dict:
     if pass_fds:
         kwargs["pass_fds"] = pass_fds
     try:
-        res = subprocess.run(argv, capture_output=True, text=True, timeout=120, **kwargs)
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, **kwargs)
     except subprocess.TimeoutExpired:
         raise InboxError("tempo esgotado ao analisar o arquivo") from None
     except OSError:

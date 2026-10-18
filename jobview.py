@@ -15,8 +15,16 @@ from transcribe import format_transcript
 
 INDEX_FRAME_RE = re.compile(r"^f_\d{5}\.jpg$")
 TRANSCRIPT_TEXT_LIMIT = 60_000
+SEARCH_TEXT_LIMIT = 40_000
+HIT_TEXT_LIMIT = 500
+TITLE_LIMIT = 300
 HEARTBEAT_STALE = 90.0
 STATE_PT = {"queued": "na fila", "running": "processando", "done": "concluído", "failed": "falhou"}
+
+
+def clip(text, limit: int) -> str:
+    text = str(text)
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def source_label(job: dict) -> str:
@@ -48,7 +56,7 @@ def status_text(job: dict, *, worker_ok: bool = True) -> str:
         f"- Progresso: {float(job.get('progress') or 0):.0f}%",
     ]
     if job.get("title"):
-        lines.append(f"- Título: {job['title']}")
+        lines.append(f"- Título: {clip(job['title'], TITLE_LIMIT)}")
     if job.get("duration"):
         lines.append(f"- Duração: {format_time(float(job['duration']))}")
     if job.get("model"):
@@ -72,7 +80,8 @@ def job_line(job: dict) -> str:
     created = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(job.get("created") or 0)))
     state = STATE_PT.get(job.get("state"), job.get("state"))
     progress = f" {float(job.get('progress') or 0):.0f}%" if job.get("state") == "running" else ""
-    title = f" — {job['title']}" if job.get("title") and job.get("title") != (job.get("source") or {}).get("value") else ""
+    title = (f" — {clip(job['title'], 120)}" if job.get("title")
+             and job.get("title") != (job.get("source") or {}).get("value") else "")
     return f"- `{job['id']}` {state}{progress} · {duration} · {created} · {source_label(job)}{title}"
 
 
@@ -104,6 +113,8 @@ def pick_frames(index: list[dict], job_dir: Path, start: float | None, end: floa
     """
     lo = start or 0.0
     hi = end if end is not None else float("inf")
+    if jobstore.is_link(job_dir) or jobstore.is_link(job_dir / "frames"):
+        return []  # frames must be this job's own directory, not a link to another
     root = (job_dir / "frames").resolve()
     picked = []
     for entry in index:
@@ -129,7 +140,7 @@ def pick_frames(index: list[dict], job_dir: Path, start: float | None, end: floa
 def watch_text(job: dict, meta: dict, segments: list[dict], *, partial: bool, start: float | None,
                end: float | None, detail: str, question: str | None, frame_times: list[float] | None,
                warnings: list[str]) -> str:
-    title = meta.get("title") or source_label(job)
+    title = clip(meta.get("title") or source_label(job), TITLE_LIMIT)
     lines = [f"# Vídeo: {title}", "", f"- Trabalho: `{job['id']}`", f"- Origem: {source_label(job)}"]
     author = meta.get("uploader") or meta.get("channel")
     if author:
@@ -174,11 +185,18 @@ def watch_text(job: dict, meta: dict, segments: list[dict], *, partial: bool, st
 def hits_text(job: dict, query: str, hits: list[dict], total: int) -> str:
     lines = [f"# Busca por “{query}” em `{job['id']}`", "", f"{total} trecho(s) encontrado(s)"
              + (f"; mostrando os {len(hits)} primeiros." if total > len(hits) else "."), ""]
-    for hit in hits:
-        lines.append(f"- [{format_time(float(hit['start']))}–{format_time(float(hit['end']))}] {hit['text']}")
-        context = " … ".join(x for x in (hit.get("before"), hit.get("after")) if x)
+    size = 0
+    for shown, hit in enumerate(hits):
+        entry = [f"- [{format_time(float(hit['start']))}–{format_time(float(hit['end']))}] "
+                 f"{clip(hit['text'], HIT_TEXT_LIMIT)}"]
+        context = " … ".join(clip(x, HIT_TEXT_LIMIT // 2) for x in (hit.get("before"), hit.get("after")) if x)
         if context:
-            lines.append(f"  - contexto: {context}")
+            entry.append(f"  - contexto: {context}")
+        size += sum(len(e) for e in entry)
+        if size > SEARCH_TEXT_LIMIT:
+            lines.append(f"- … resposta cortada por tamanho ({len(hits) - shown} trecho(s) não mostrados).")
+            break
+        lines += entry
     if hits:
         first = float(hits[0]["start"])
         lines += ["", f"Para ver um trecho: watch_video(job_id=\"{job['id']}\", start=\"{format_time(max(0, first - 10))}\", "

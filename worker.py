@@ -22,6 +22,7 @@ cookies are copied to a private dir on the container's tmpfs.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -62,7 +63,13 @@ PROMPT_PTBR = (
 )
 PROMPT_LIMIT = 800  # characters; Whisper only keeps the last ~224 prompt tokens
 FRAME_LONG_SIDE = mcp_server.FRAME_LONG_SIDE
+# Index size: one grid frame at least every duration/MAX_INDEX_FRAMES s (≥ 2 s)
+# and scene cuts no closer than half that, so a job never exceeds
+# ~3 x MAX_INDEX_FRAMES frames and the index always reaches the end.
 MAX_INDEX_FRAMES = 2500
+INDEX_FRAME_BYTES = 60_000  # generous per-JPEG estimate for the disk check
+AUDIO_BYTES_PER_SECOND = 8_000  # 64 kb/s mp3
+TITLE_LIMIT = 300
 SCENE_THRESHOLD = 0.3
 WHISPER_RETRIES = (30, 60, 120)  # seconds to wait before each retry of a chunk
 MAX_ATTEMPTS = 3  # a job that keeps killing the worker is failed, not resumed forever
@@ -125,13 +132,45 @@ def _kill(proc: subprocess.Popen) -> None:
 # ── job helpers ─────────────────────────────────────────────────────────────
 
 
+def _finite(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def validate(data: dict) -> None:
+    """Reject a job.json the worker did not write the way it expects (JobFailed)."""
+    source = data.get("source")
+    problems = []
+    if not (isinstance(source, dict) and source.get("kind") in ("url", "inbox")
+            and isinstance(source.get("value"), str) and source["value"]):
+        problems.append("source")
+    if data.get("language") is not None and not isinstance(data.get("language"), str):
+        problems.append("language")
+    if data.get("quality", "auto") not in ("auto", "fast", "accurate"):
+        problems.append("quality")
+    terms = data.get("terms") or []
+    if not (isinstance(terms, list) and all(isinstance(t, str) for t in terms)):
+        problems.append("terms")
+    for key in ("started",):
+        if data.get(key) is not None and not _finite(data[key]):
+            problems.append(key)
+    attempts = data.get("attempts")
+    if attempts is not None and not (isinstance(attempts, int) and not isinstance(attempts, bool) and attempts >= 0):
+        problems.append("attempts")
+    for key in ("model", "fingerprint", "source_identity"):
+        value = data.get(key)
+        if value is not None and not isinstance(value, (str, list, dict)):
+            problems.append(key)
+    if problems:
+        raise JobFailed(f"trabalho corrompido no cache (campos inválidos: {', '.join(problems)})")
+
+
 class Job:
     def __init__(self, data: dict, root: Path | None = None):
         self.id = data["id"]
         self.root = root
         self.dir = jobstore.job_path(self.id, root)
         self.data = data
-        started = data.get("started") or time.time()
+        started = data.get("started") if _finite(data.get("started")) else time.time()
         self.deadline = started + JOB_TIMEOUT
 
     @property
@@ -146,6 +185,27 @@ class Job:
         if left <= 0:
             raise JobFailed(f"tempo total do trabalho excedido ({JOB_TIMEOUT / 3600:.1f} h)")
         return left
+
+
+def cache_used(root: Path | None) -> int:
+    return sum(jobstore.dir_size(jobstore.job_path(j["id"], root)) for j in jobstore.list_jobs(root))
+
+
+def ensure_room(job: Job, need: int) -> int:
+    """Room left under WATCH_JOBS_MAX_BYTES once `need` more bytes are written.
+
+    Finished jobs are evicted first (oldest first); queued/running never are.
+    """
+    used = cache_used(job.root)
+    if used + need > MAX_JOBS_BYTES:
+        jobstore.cleanup(job.root, ttl_seconds=TTL_SECONDS, max_bytes=max(0, MAX_JOBS_BYTES - need))
+        used = cache_used(job.root)
+    if used + need > MAX_JOBS_BYTES:
+        raise JobFailed(
+            f"sem espaço no cache de trabalhos (teto de {MAX_JOBS_BYTES / 1024**3:.1f} GB, "
+            f"em uso {used / 1024**3:.2f} GB); apague trabalhos antigos ou aumente WATCH_JOBS_MAX_BYTES"
+        )
+    return MAX_JOBS_BYTES - used - need
 
 
 def pick_model(quality: str, duration: float) -> str:
@@ -174,6 +234,11 @@ def scale_filter() -> str:
 def grid_interval(duration: float) -> float:
     """At least one index frame this often; ≤ MAX_INDEX_FRAMES grid frames per job."""
     return max(2.0, duration / MAX_INDEX_FRAMES)
+
+
+def index_bound(duration: float) -> int:
+    """Upper bound of index frames: consecutive frames are ≥ grid/2 apart."""
+    return int(duration / (grid_interval(duration) / 2)) + 2
 
 
 # ── stage 1: source ─────────────────────────────────────────────────────────
@@ -212,12 +277,16 @@ class Source:
         except OSError:
             pass
 
+    def identity(self) -> dict:
+        st = os.fstat(self.fd)
+        return {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "duration": round(self.info["duration"], 3)}
 
-def open_checked(name: str, root: Path) -> Source:
+
+def open_checked(name: str, root: Path, timeout: float = 120.0) -> Source:
     fd = inbox.open_media(name, root)
     src = Source(fd, {}, Path(root) / name)
     try:
-        src.info = inbox.probe(src.path, pass_fds=src.fds)
+        src.info = inbox.probe(src.path, pass_fds=src.fds, timeout=min(120.0, timeout))
         if src.info["duration"] > MAX_DURATION:
             raise JobFailed(f"mídia muito longa ({src.info['duration'] / 3600:.1f} h); "
                             f"o limite é {MAX_DURATION / 3600:.1f} h")
@@ -249,25 +318,30 @@ def download(job: Job, url: str) -> Path:
         return work / name
     for stale in work.glob("source.*"):  # an interrupted download starts over
         stale.unlink()
+    room = ensure_room(job, 0)
+    budget = min(MAX_DOWNLOAD_BYTES, room)
     tmp = Path(tempfile.mkdtemp(prefix="watch-worker-"))
     try:
         cookies = private_cookies(tmp)
         secrets = mcp_server.cookie_secrets(cookies)
-        with netguard.EgressProxy(max_bytes=MAX_DOWNLOAD_BYTES) as proxy:
+        with netguard.EgressProxy(max_bytes=budget) as proxy:
             extra = mcp_server.ytdlp_args(
-                proxy.url, cookies, max_duration=MAX_DURATION, max_filesize=f"{MAX_DOWNLOAD_BYTES}",
+                proxy.url, cookies, max_duration=MAX_DURATION, max_filesize=f"{budget}",
             )
             env = mcp_server.child_env({})
             meta = run(["yt-dlp", *extra, "--skip-download", "--dump-single-json", "--no-playlist",
                         "--no-warnings", "--", url], timeout=min(600, job.remaining()), env=env, cwd=tmp)
             info = _metadata(url, meta, secrets, proxy)
-            write_meta(job, info)
-            job.update(stage="baixando", progress=2.0, title=info.get("title"),
-                       duration=info.get("duration"))
+            shown = write_meta(job, info, secrets)
+            job.update(stage="baixando", progress=2.0, title=shown.get("title"),
+                       duration=info.get("duration") if _finite(info.get("duration")) else None)
             got = run(["yt-dlp", *extra, "-N", "4", "-f", DOWNLOAD_FORMAT, "--merge-output-format", "mkv",
                        "--no-playlist", "-o", str(work / "source.%(ext)s"), "--", url],
                       timeout=job.remaining(), env=env, cwd=tmp)
             if proxy.exceeded:
+                if budget < MAX_DOWNLOAD_BYTES:
+                    raise JobFailed(f"sem espaço no cache de trabalhos para o download "
+                                    f"(cabiam {budget / 1024**3:.2f} GB; teto WATCH_JOBS_MAX_BYTES)")
                 raise JobFailed(f"o download passou do limite de {MAX_DOWNLOAD_BYTES / 1024**3:.1f} GB")
         files = [p for p in work.glob("source.*") if p.suffix not in (".part", ".ytdl")]
         if got.returncode != 0 or not files:
@@ -309,25 +383,54 @@ def _metadata(url: str, meta: subprocess.CompletedProcess, secrets: frozenset[st
     return info
 
 
-def write_meta(job: Job, info: dict) -> None:
-    """Only display fields; the raw yt-dlp JSON (format URLs, headers) is not kept."""
-    keep = ("title", "uploader", "channel", "uploader_id", "webpage_url", "upload_date", "duration",
-            "width", "height")
-    meta = {k: info.get(k) for k in keep if info.get(k) is not None}
-    description = (info.get("description") or "").strip()
-    if description:
-        meta["description"] = description[:mcp_server.DESCRIPTION_LIMIT]
+def write_meta(job: Job, info: dict, secrets: frozenset[str] = frozenset()) -> dict:
+    """Only display fields, with every cookie value redacted (a site can echo the
+    jar into its title or description); the raw yt-dlp JSON is not kept."""
+    meta: dict = {}
+    for key in ("title", "uploader", "channel", "uploader_id", "webpage_url", "upload_date"):
+        value = info.get(key)
+        if isinstance(value, str) and value.strip():
+            meta[key] = mcp_server.scrub(value.strip()[:TITLE_LIMIT], secrets)
+    for key in ("duration", "width", "height"):
+        if _finite(info.get(key)):
+            meta[key] = info[key]
+    description = info.get("description")
+    if isinstance(description, str) and description.strip():
+        meta["description"] = mcp_server.scrub(description.strip()[:mcp_server.DESCRIPTION_LIMIT], secrets)
     jobstore.write_json_atomic(job.dir / "meta.json", meta)
+    return meta
 
 
 def open_source(job: Job, inbox_root: Path) -> Source:
     source = job.data["source"]
     if source["kind"] == "inbox":
-        jobstore.write_json_atomic(job.dir / "meta.json", {"title": source["value"]})
-        return open_checked(source["value"], inbox_root)
-    path = download(job, source["value"])
-    # The downloaded file is untrusted too: same probe, same fd discipline.
-    return open_checked(path.name, path.parent)
+        jobstore.write_json_atomic(job.dir / "meta.json", {"title": source["value"][:TITLE_LIMIT]})
+        src = open_checked(source["value"], inbox_root, job.remaining())
+    else:
+        path = download(job, source["value"])
+        # The downloaded file is untrusted too: same probe, same fd discipline.
+        src = open_checked(path.name, path.parent, job.remaining())
+    try:
+        check_identity(job, src)
+    except BaseException:
+        src.close()
+        raise
+    return src
+
+
+def check_identity(job: Job, src: Source) -> None:
+    """Artifacts of one job come from one file: the one the server saw (inbox
+    fingerprint) and the one opened first (resume after a restart)."""
+    now = src.identity()
+    changed = JobFailed("o arquivo de origem mudou durante o processamento; rode analyze_video de novo")
+    seen = job.data.get("fingerprint")
+    if job.data["source"]["kind"] == "inbox" and seen and list(seen) != [now["size"], now["mtime_ns"]]:
+        raise changed
+    first = job.data.get("source_identity")
+    if first is None:
+        job.update(source_identity=now)
+    elif first != now:
+        raise changed
 
 
 # ── stage 2: audio + chunk plan ─────────────────────────────────────────────
@@ -343,10 +446,12 @@ def extract_audio(job: Job, src: Source) -> None:
         jobstore.write_json_atomic(job.dir / "plan.json", {"chunks": [], "duration": duration})
         return
     job.update(stage="extraindo áudio", progress=15.0)
+    need = int((duration + 10) * AUDIO_BYTES_PER_SECOND * 1.2) + 65_536
+    ensure_room(job, need)
     tmp = job.work / "audio.tmp.mp3"
     got = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *src.input(), "-t", src.limit(),
-               "-vn", "-acodec", "libmp3lame", "-ar", "16000", "-ac", "1", "-b:a", "64k", str(tmp)],
-              timeout=job.remaining(), pass_fds=src.fds)
+               "-vn", "-acodec", "libmp3lame", "-ar", "16000", "-ac", "1", "-b:a", "64k", "-fs", str(need),
+               str(tmp)], timeout=job.remaining(), pass_fds=src.fds)
     if got.returncode != 0 or not tmp.exists():
         raise JobFailed("não foi possível extrair o áudio")
     tmp.replace(audio)
@@ -367,13 +472,20 @@ def build_index(job: Job, src: Source) -> None:
     if not src.info["has_video"]:
         jobstore.write_json_atomic(job.dir / "index.json", {"frames": []})
         return
+    duration = src.info["duration"]
+    bound = index_bound(duration)
+    ensure_room(job, bound * INDEX_FRAME_BYTES)
     frames.mkdir()
     job.update(stage="indexando cenas", progress=20.0)
-    grid = grid_interval(src.info["duration"])
-    select = f"select='eq(n\\,0)+gt(scene\\,{SCENE_THRESHOLD})+gte(t-prev_selected_t\\,{grid})'"
+    grid = grid_interval(duration)
+    # Grid frames keep coverage to the end; scene cuts only count when at least
+    # grid/2 after the previous frame, which bounds the total (no -frames:v cap
+    # that would stop before the end).
+    select = (f"select='eq(n\\,0)+gte(t-prev_selected_t\\,{grid})"
+              f"+gt(scene\\,{SCENE_THRESHOLD})*gte(t-prev_selected_t\\,{grid / 2})'")
     got = run(["ffmpeg", "-hide_banner", "-loglevel", "info", "-y", *src.input(), "-t", src.limit(),
                "-an", "-sn", "-vf", f"{scale_filter()},{select},showinfo", "-fps_mode", "vfr",
-               "-frames:v", str(MAX_INDEX_FRAMES * 3), "-q:v", "5", str(frames / "f_%05d.jpg")],
+               "-frames:v", str(bound), "-q:v", "5", str(frames / "f_%05d.jpg")],
               timeout=job.remaining(), pass_fds=src.fds)
     if got.returncode != 0:
         raise JobFailed("não foi possível extrair os frames do vídeo")
@@ -422,8 +534,8 @@ def transcribe(job: Job) -> None:
     fresh_audio = 0.0
     for i, (start, end) in enumerate(chunks):
         out = chunk_dir / f"{i:04d}.json"
-        if out.exists():
-            continue
+        if isinstance((jobstore.read_json(out) or {}).get("segments"), list):
+            continue  # finished before a restart (a corrupt file is redone)
         done_audio = sum(e - s for s, e in chunks[:i])
         rate = fresh_audio / (time.monotonic() - started) if fresh_audio else None
         eta = (duration - done_audio) / rate if rate else None
@@ -494,10 +606,14 @@ def collapse_repeats(segments: list[dict], keep: int = 2) -> list[dict]:
 
 
 def transcribe_chunk(job: Job, piece: Path, *, model: str, language: str | None, prompt: str | None) -> list[dict]:
+    """One chunk, entirely inside the job deadline (health wait, request, retries)."""
     for wait in (*WHISPER_RETRIES, None):
-        whisper_ready()
+        whisper_ready(timeout=min(600.0, job.remaining()))
         try:
-            return transcribe_local(piece, model=model, language=language, prompt=prompt)
+            segments = transcribe_local(piece, model=model, language=language, prompt=prompt,
+                                        deadline=time.monotonic() + job.remaining())
+            job.remaining()  # a reply that lands after the deadline does not count
+            return segments
         except SystemExit as exc:
             if wait is None or job.remaining() < wait:
                 raise JobFailed(f"a transcrição falhou: {exc}") from None
@@ -510,8 +626,13 @@ def transcribe_chunk(job: Job, piece: Path, *, model: str, language: str | None,
 
 
 def process(data: dict, *, root: Path | None = None, inbox_root: Path | None = None) -> None:
+    try:
+        validate(data)
+    except JobFailed as exc:
+        jobstore.update_job(data["id"], root, state="failed", stage="falhou", error=str(exc), finished=time.time())
+        return
     job = Job(data, root)
-    attempts = int(data.get("attempts") or 0) + 1
+    attempts = (data.get("attempts") or 0) + 1
     if not data.get("started"):
         job.update(state="running", started=time.time(), stage="preparando", progress=1.0, attempts=attempts)
     else:
@@ -523,13 +644,13 @@ def process(data: dict, *, root: Path | None = None, inbox_root: Path | None = N
         if not ((job.dir / "plan.json").exists() and (job.dir / "index.json").exists()):
             src = open_source(job, inbox_root or inbox.INBOX_DIR)
             job.update(duration=src.info["duration"], has_video=src.info["has_video"])
-            check_disk(job)
             extract_audio(job, src)
             build_index(job, src)
             src.close()
             src = None
-            for leftover in [*job.work.glob("source.*"), job.work / "download.done"]:
-                leftover.unlink(missing_ok=True)  # the whole video is not kept
+        # Runs on every pass, also when a restart skipped the stages above.
+        for leftover in [*job.work.glob("source.*"), job.work / "download.done"]:
+            leftover.unlink(missing_ok=True)  # the whole video is not kept
         transcribe(job)
         shutil.rmtree(job.work, ignore_errors=True)
         job.update(state="done", stage="concluído", progress=100.0, eta_seconds=None, finished=time.time())
@@ -547,12 +668,6 @@ def fail(job: Job, message: str) -> None:
     shutil.rmtree(job.work, ignore_errors=True)
     job.update(state="failed", stage="falhou", error=mcp_server.scrub(message), eta_seconds=None,
                finished=time.time())
-
-
-def check_disk(job: Job) -> None:
-    used = sum(jobstore.dir_size(jobstore.job_path(j["id"], job.root)) for j in jobstore.list_jobs(job.root))
-    if used > MAX_JOBS_BYTES:
-        raise JobFailed(f"o cache de trabalhos passou do teto de {MAX_JOBS_BYTES / 1024**3:.0f} GB")
 
 
 def heartbeat(every: float = 15.0) -> None:
@@ -580,8 +695,17 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
         log(f"{job['id']}: {job.get('state')} → processing")
-        process(job)
-        log(f"{job['id']}: {jobstore.load_job(job['id']).get('state')}")
+        try:
+            process(job)
+            log(f"{job['id']}: {jobstore.load_job(job['id']).get('state')}")
+        except Exception as exc:  # noqa: BLE001 - one bad job must not stop the queue
+            log(f"{job['id']}: worker error {type(exc).__name__}; marking it failed")
+            try:
+                jobstore.update_job(job["id"], state="failed", stage="falhou",
+                                    error=f"erro interno no worker ({type(exc).__name__})", finished=time.time())
+            except Exception as again:  # noqa: BLE001
+                log(f"{job['id']}: could not mark failed ({type(again).__name__})")
+                time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":

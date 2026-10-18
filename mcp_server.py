@@ -101,6 +101,7 @@ LANGUAGE_RE = re.compile(r"^[a-z]{2}$")
 MAX_TERMS = 30
 TERM_MAX_LEN = 60
 LIST_JOBS_LIMIT = 20
+LIST_INBOX_LIMIT = 200
 
 mcp = MCPServer(
     "watch",
@@ -790,6 +791,8 @@ async def analyze_video(
         "quality": quality,
         "terms": terms,
         "cache_key": key,
+        # What the server saw (inbox: size + mtime); the worker refuses a changed file.
+        "fingerprint": fingerprint or None,
     })
     text = (
         f"Trabalho criado: job_id = {job['id']}\n\n"
@@ -844,8 +847,10 @@ async def list_inbox() -> str:
         return ("A caixa de entrada está vazia (D:\\Inbox no Windows). Extensões aceitas: "
                 + ", ".join(sorted(inbox.ALLOWED_EXTS)))
     lines = ["# Caixa de entrada", ""]
-    for f in files:
+    for f in files[:LIST_INBOX_LIMIT]:
         lines.append(f"- {f['name']} — {f['size_bytes'] / 1024**2:.1f} MB — {f['modified']}")
+    if len(files) > LIST_INBOX_LIMIT:
+        lines.append(f"- … e mais {len(files) - LIST_INBOX_LIMIT} arquivo(s).")
     return "\n".join(lines + ["", 'Use analyze_video(source="<nome do arquivo>").'])
 
 

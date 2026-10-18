@@ -339,7 +339,10 @@ def _post_whisper(
     model: str,
     audio_path: Path,
     extra: dict[str, str | None] | None = None,
+    deadline: float | None = None,
 ) -> dict:
+    """POST one file, retrying transient failures. `deadline` (time.monotonic())
+    bounds every attempt and backoff; past it, SystemExit."""
     fields = {
         "model": model,
         "response_format": "verbose_json",
@@ -365,10 +368,23 @@ def _post_whisper(
     last_exc: Exception | None = None
     last_detail = ""
 
+    def time_left() -> float:
+        if deadline is None:
+            return timeout
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise SystemExit(f"Whisper request stopped: deadline exceeded ({last_exc or 'no attempt left'})")
+        return min(timeout, left)
+
+    def backoff(delay: float) -> None:
+        if deadline is not None and time.monotonic() + delay >= deadline:
+            raise SystemExit(f"Whisper request failed before the deadline: {last_exc}{last_detail}")
+        time.sleep(delay)
+
     for attempt in range(MAX_ATTEMPTS):
         request = Request(endpoint, data=body, headers=headers, method="POST")
         try:
-            with urlopen(request, timeout=timeout, context=context) as response:
+            with urlopen(request, timeout=time_left(), context=context) as response:
                 payload = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = _read_error_body(exc)
@@ -392,7 +408,7 @@ def _post_whisper(
                     f"(attempt {attempt + 2}/{MAX_ATTEMPTS})",
                     file=sys.stderr,
                 )
-                time.sleep(delay)
+                backoff(delay)
             continue
         except (urllib.error.URLError, TimeoutError, ConnectionResetError, OSError) as exc:
             last_exc, last_detail = exc, ""
@@ -403,7 +419,7 @@ def _post_whisper(
                     f"retrying in {delay:.1f}s (attempt {attempt + 2}/{MAX_ATTEMPTS})",
                     file=sys.stderr,
                 )
-                time.sleep(delay)
+                backoff(delay)
             continue
 
         try:
@@ -535,6 +551,7 @@ def transcribe_local(
     model: str,
     language: str | None = None,
     prompt: str | None = None,
+    deadline: float | None = None,
 ) -> list[dict]:
     """One request to the local server with an explicit model, language and
     initial prompt; returns 0-based segments. For callers that do their own
@@ -546,6 +563,7 @@ def transcribe_local(
         model,
         audio_path,
         {"language": language, "prompt": prompt},
+        deadline=deadline,
     )
     return _segments_from_response(response)
 
