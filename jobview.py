@@ -5,6 +5,7 @@ writes or runs ffmpeg (the server only enqueues, reads and serves).
 """
 from __future__ import annotations
 
+import math
 import re
 import time
 from pathlib import Path
@@ -34,7 +35,8 @@ def source_label(job: dict) -> str:
 
 
 def eta_text(seconds) -> str | None:
-    if not isinstance(seconds, (int, float)) or seconds <= 0:
+    seconds = jobstore.as_number(seconds)
+    if seconds <= 0:
         return None
     return f"~{format_time(seconds)}" if seconds >= 60 else "menos de 1 min"
 
@@ -53,12 +55,12 @@ def status_text(job: dict, *, worker_ok: bool = True) -> str:
         f"- Origem: {source_label(job)}",
         f"- Estado: {STATE_PT.get(state, state)}",
         f"- Etapa: {job.get('stage') or '-'}",
-        f"- Progresso: {float(job.get('progress') or 0):.0f}%",
+        f"- Progresso: {jobstore.as_number(job.get('progress')):.0f}%",
     ]
     if job.get("title"):
         lines.append(f"- Título: {clip(job['title'], TITLE_LIMIT)}")
-    if job.get("duration"):
-        lines.append(f"- Duração: {format_time(float(job['duration']))}")
+    if jobstore.as_number(job.get("duration")) > 0:
+        lines.append(f"- Duração: {format_time(jobstore.as_number(job['duration']))}")
     if job.get("model"):
         lines.append(f"- Modelo de transcrição: {job['model']} (idioma: {job.get('language') or 'automático'})")
     eta = eta_text(job.get("eta_seconds")) if state == "running" else None
@@ -76,10 +78,14 @@ def status_text(job: dict, *, worker_ok: bool = True) -> str:
 
 
 def job_line(job: dict) -> str:
-    duration = format_time(float(job["duration"])) if job.get("duration") else "?"
-    created = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(job.get("created") or 0)))
+    seconds = jobstore.as_number(job.get("duration"))
+    duration = format_time(seconds) if seconds > 0 else "?"
+    try:
+        created = time.strftime("%Y-%m-%d %H:%M", time.localtime(jobstore.as_number(job.get("created"))))
+    except (OverflowError, OSError, ValueError):
+        created = "?"
     state = STATE_PT.get(job.get("state"), job.get("state"))
-    progress = f" {float(job.get('progress') or 0):.0f}%" if job.get("state") == "running" else ""
+    progress = f" {jobstore.as_number(job.get('progress')):.0f}%" if job.get("state") == "running" else ""
     title = (f" — {clip(job['title'], 120)}" if job.get("title")
              and job.get("title") != (job.get("source") or {}).get("value") else "")
     return f"- `{job['id']}` {state}{progress} · {duration} · {created} · {source_label(job)}{title}"
@@ -93,9 +99,11 @@ def _usable(segments) -> list[dict]:
     for s in segments:
         if isinstance(s, dict) and isinstance(s.get("text"), str):
             try:
-                out.append({"start": float(s["start"]), "end": float(s["end"]), "text": s["text"]})
+                start, end = float(s["start"]), float(s["end"])
             except (KeyError, TypeError, ValueError, OverflowError):
                 continue
+            if math.isfinite(start) and math.isfinite(end) and 0 <= start <= end:
+                out.append({"start": start, "end": end, "text": s["text"]})
     return out
 
 
@@ -159,8 +167,8 @@ def watch_text(job: dict, meta: dict, segments: list[dict], *, partial: bool, st
     author = meta.get("uploader") or meta.get("channel")
     if author:
         lines.append(f"- Autor: {author}")
-    if job.get("duration"):
-        d = float(job["duration"])
+    d = jobstore.as_number(job.get("duration"))
+    if d > 0:
         lines.append(f"- Duração: {format_time(d)} ({d:.1f}s)")
     if meta.get("upload_date"):
         u = str(meta["upload_date"])

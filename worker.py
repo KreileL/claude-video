@@ -35,8 +35,6 @@ import time
 import urllib.request
 import hashlib
 import zlib
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeout
 from pathlib import Path
 
 import chunking
@@ -116,13 +114,13 @@ def run(argv: list[str], *, timeout: float, pass_fds: tuple[int, ...] = (), env:
     group dies (yt-dlp spawns ffmpeg). `disk=(dir, room)`: the step is killed as
     soon as what it wrote under dir exceeds room bytes (real bytes, checked
     every DISK_POLL s — not an estimate)."""
+    limit = jobstore.dir_size(disk[0]) + disk[1] if disk else None  # before the child writes
+    end = time.monotonic() + max(1.0, timeout)
     proc = subprocess.Popen(
         argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace", pass_fds=pass_fds, env=env,
         cwd=str(cwd) if cwd else None, start_new_session=os.name == "posix",
     )
-    end = time.monotonic() + max(1.0, timeout)
-    limit = jobstore.dir_size(disk[0]) + disk[1] if disk else None
     try:
         while True:
             try:
@@ -137,11 +135,10 @@ def run(argv: list[str], *, timeout: float, pass_fds: tuple[int, ...] = (), env:
                     _kill(proc)
                     proc.communicate()
                     raise JobFailed(f"tempo limite excedido em {Path(argv[0]).name}") from None
-    except BaseException:
-        _kill(proc)
-        raise
-    if disk and jobstore.dir_size(disk[0]) > limit:
-        raise JobFailed(NO_ROOM)
+        if disk and jobstore.dir_size(disk[0]) > limit:
+            raise JobFailed(NO_ROOM)
+    finally:
+        _kill(proc)  # every path, the final size check included: strays must not outlive the step
     _kill(proc)  # strays left by the child must not outlive the step
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
@@ -568,12 +565,20 @@ def whisper_ready(timeout: float = 600.0) -> None:
         if left <= 0:
             raise JobFailed(f"o Whisper local (watch-whisper) não respondeu a tempo: {mcp_server.STACK_HINT}")
         try:
-            with urllib.request.urlopen(url, timeout=min(5.0, left)) as response:
-                if response.status == 200:
-                    return
-        except Exception:
+            # Bounded as a whole (connect, headers): a socket timeout is per operation.
+            if within(min(5.0, left), lambda: _health_ok(url, min(5.0, left))):
+                return
+        except JobFailed:
             pass
         time.sleep(max(0.0, min(10.0, end - time.monotonic())))
+
+
+def _health_ok(url: str, timeout: float) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return response.status == 200
+    except Exception:
+        return False
 
 
 def transcribe(job: Job) -> None:
@@ -597,7 +602,8 @@ def transcribe(job: Job) -> None:
         eta = (duration - done_audio) / rate if rate else (duration - done_audio) * SPEED_HINT.get(model, 0.6)
         job.update(stage=f"transcrevendo ({i + 1}/{len(chunks)})", chunks_done=i,
                    progress=round(30 + 70 * done_audio / max(duration, 1), 1), eta_seconds=eta)
-        piece = cut_audio(job, start, end, f"chunk_{i:04d}")
+        room = ensure_room(job, int((end - start) * AUDIO_BYTES_PER_SECOND * 1.2) + 200_000)
+        piece = cut_audio(job, start, end, f"chunk_{i:04d}", room)
         segments = transcribe_chunk(job, piece, model=model, language=language, prompt=prompt)
         piece.unlink(missing_ok=True)
         if looks_repetitive(segments):
@@ -606,7 +612,7 @@ def transcribe(job: Job) -> None:
             t = start
             while t < end - 0.5:
                 stop = min(end, t + LOOP_PIECE_SECONDS)
-                small = cut_audio(job, t, stop, f"chunk_{i:04d}_piece")
+                small = cut_audio(job, t, stop, f"chunk_{i:04d}_piece", room)
                 part = transcribe_chunk(job, small, model=model, language=language, prompt=prompt)
                 small.unlink(missing_ok=True)
                 segments += [{**seg, "start": seg["start"] + t - start, "end": seg["end"] + t - start} for seg in part]
@@ -624,11 +630,11 @@ def transcribe(job: Job) -> None:
     })
 
 
-def cut_audio(job: Job, start: float, end: float, name: str) -> Path:
+def cut_audio(job: Job, start: float, end: float, name: str, room: int) -> Path:
     piece = job.work / f"{name}.mp3"
     got = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *inbox.input_args("mp3"),
                "-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-i", str(job.work / "audio.mp3"),
-               "-c", "copy", str(piece)], timeout=min(600, job.remaining()))
+               "-c", "copy", str(piece)], timeout=min(600, job.remaining()), disk=(job.work, room))
     if got.returncode != 0 or not piece.exists():
         raise JobFailed(f"não foi possível cortar o áudio em {start:.0f}s")
     return piece
@@ -666,20 +672,29 @@ def within(seconds: float, call):
     operation, so a slow upload or a trickling reply could otherwise hold the
     single worker long past the job deadline. The abandoned request ends on its
     own socket timeout."""
-    pool = ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(call)
-    try:
-        return future.result(timeout=max(0.0, seconds))
-    except FutureTimeout:
+    box: dict = {}
+
+    def target():
+        try:
+            box["value"] = call()
+        except BaseException as exc:  # noqa: BLE001 - handed back to the caller
+            box["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)  # an abandoned call never blocks exit
+    thread.start()
+    thread.join(max(0.0, seconds))
+    if thread.is_alive():
         raise JobFailed(f"tempo total do trabalho excedido ({JOB_TIMEOUT / 3600:.1f} h): "
-                        "o Whisper não respondeu a tempo") from None
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+                        "o Whisper não respondeu a tempo")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
 
 
 def valid_segments(segments) -> bool:
     return isinstance(segments, list) and all(
-        isinstance(s, dict) and _finite(s.get("start")) and _finite(s.get("end")) and isinstance(s.get("text"), str)
+        isinstance(s, dict) and _finite(s.get("start")) and _finite(s.get("end"))
+        and 0 <= s["start"] <= s["end"] and isinstance(s.get("text"), str)
         for s in segments
     )
 

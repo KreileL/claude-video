@@ -154,11 +154,11 @@ def list_jobs(root: Path | None = None) -> list[dict]:
         job = _valid_job(name, entry)
         if job is not None:
             jobs.append(job)
-    jobs.sort(key=lambda j: _num(j.get("created")), reverse=True)
+    jobs.sort(key=lambda j: as_number(j.get("created")), reverse=True)
     return jobs
 
 
-def _num(v: Any) -> float:
+def as_number(v: Any) -> float:
     """A sortable number; anything else (bool, str, huge int, NaN) counts as 0."""
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         return 0.0
@@ -179,7 +179,7 @@ def find_cached(cache_key: str, root: Path | None = None) -> dict | None:
 
 def next_job(root: Path | None = None) -> dict | None:
     """Oldest running job (resume after restart), else oldest queued."""
-    jobs = sorted(list_jobs(root), key=lambda j: _num(j.get("created")))
+    jobs = sorted(list_jobs(root), key=lambda j: as_number(j.get("created")))
     for state in ("running", "queued"):
         for job in jobs:
             if job.get("state") == state:
@@ -232,7 +232,7 @@ def cleanup(root: Path | None = None, *, ttl_seconds: float, max_bytes: int,
         if job.get("state") not in ("done", "failed"):
             sizes[name] = dir_size(Path(entry.path))
             continue
-        updated = _num(job.get("updated"))
+        updated = as_number(job.get("updated"))
         if now - updated > ttl_seconds:
             if _remove(entry.path):
                 removed.append(name)

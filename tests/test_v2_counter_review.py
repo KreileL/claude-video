@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 
@@ -523,3 +524,102 @@ def test_p2_n2_search_query_length_is_capped(tmp_path, monkeypatch):
                                {"segments": [{"start": 0, "end": 1, "text": "hello"}]})
     with pytest.raises(ToolError, match="busca"):
         run(mcp_server.search_transcript(data["id"], "q" * 1_000_000))
+
+
+# ── third Codex pass (.codex/review-mcp-v2-pass3.md) ────────────────────────
+
+
+def test_p3_disk_is_measured_before_the_step_starts_and_the_group_is_killed(tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    out.mkdir()
+    killed = []
+    real_kill = worker._kill
+    monkeypatch.setattr(worker, "_kill", lambda proc: killed.append(proc.pid) or real_kill(proc))
+    code = f"open(r'{out / 'x.bin'}', 'wb').write(b'x' * 8192)"
+    with pytest.raises(worker.JobFailed, match="espaço"):
+        worker.run([sys.executable, "-c", code], timeout=30, disk=(out, 0))
+    assert killed  # the final size check still cleans up the process group
+
+
+def test_p3_health_wait_with_trickling_headers_respects_the_deadline(monkeypatch):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n":
+                try:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(0.03)
+
+        def log_message(self, *args):
+            pass
+
+    with server_for(Handler) as url:
+        monkeypatch.setenv("WATCH_WHISPER_URL", url + "/v1/audio/transcriptions")
+        start = time.monotonic()
+        with pytest.raises(worker.JobFailed):
+            worker.whisper_ready(timeout=0.15)
+        assert time.monotonic() - start < 0.6
+
+
+def test_p3_within_never_leaves_non_daemon_threads():
+    before = {t.ident for t in threading.enumerate()}
+    with pytest.raises(worker.JobFailed):
+        worker.within(0.05, lambda: time.sleep(0.5))
+    leftovers = [t for t in threading.enumerate() if t.ident not in before and t.is_alive()]
+    assert leftovers and all(t.daemon for t in leftovers)
+
+
+def test_p3_nonfinite_or_inverted_segments_are_not_served(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobstore, "JOBS_DIR", tmp_path)
+    data = new_job(tmp_path)
+    d = tmp_path / data["id"]
+    (d / "transcript.json").write_text(
+        '{"segments": [{"start": NaN, "end": 1, "text": "ruim"}, {"start": 5, "end": 2, "text": "ruim"},'
+        ' {"start": 0, "end": Infinity, "text": "ruim"}, {"start": 1, "end": 2, "text": "bom alvo"}]}',
+        encoding="utf-8")
+    jobstore.write_json_atomic(d / "index.json", {"frames": []})
+    found = run(mcp_server.search_transcript(data["id"], "alvo"))
+    assert "bom alvo" in found and "ruim" not in found
+    assert "ruim" not in run(mcp_server.watch_video(job_id=data["id"], detail="transcript"))[0].text
+    assert not worker.valid_segments([{"start": 5, "end": 2, "text": "x"}])
+
+
+def test_p3_direct_path_redacts_before_truncating_the_description():
+    secret = "SYNTHETIC-COOKIE-SECRET-0123456789abcdef"
+    prefix = secret[:25]
+    result = mcp_server.RunResult(
+        info={"title": "t", "description": "x" * (mcp_server.DESCRIPTION_LIMIT - len(prefix)) + secret},
+        secrets=frozenset({secret}),
+    )
+    text = mcp_server.scrub(
+        mcp_server.build_text("https://example.test/v", result, question=None, detail="transcript",
+                              start=None, end=None, frames=None),
+        result.secrets,
+    )
+    assert prefix not in text
+
+
+def test_p3_transcription_respects_the_cache_cap(dirs, monkeypatch):  # noqa: F811
+    jobs, box = dirs
+    make_clip(box / "clip.mp4", seconds=6)
+    data = new_job(jobs)
+    monkeypatch.setattr(worker, "transcribe", lambda job: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        worker.process(data, root=jobs, inbox_root=box)
+    monkeypatch.undo()
+    monkeypatch.setattr(worker, "MAX_JOBS_BYTES", jobstore.dir_size(jobs) + 1000)
+    monkeypatch.setattr(worker, "WHISPER_RETRIES", ())
+    worker.process(jobstore.load_job(data["id"], jobs), root=jobs, inbox_root=box)
+    final = jobstore.load_job(data["id"], jobs)
+    assert final["state"] == "failed" and "espaço" in final["error"]
+
+
+def test_p3_corrupt_numbers_never_break_the_listing(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobstore, "JOBS_DIR", tmp_path)
+    bad = new_job(tmp_path, created=10**400, duration="x", progress=float("nan"))
+    jobstore.update_job(bad["id"], tmp_path, eta_seconds=10**400, state="running")
+    listing = run(mcp_server.list_jobs())
+    assert bad["id"] in listing
+    assert bad["id"] in run(mcp_server.job_status(bad["id"]))

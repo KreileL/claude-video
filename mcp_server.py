@@ -610,7 +610,8 @@ def build_text(
     if question:
         lines.append(f"- Pergunta do usuário: {question}")
 
-    description = (info.get("description") or "").strip()
+    # Redact first: a cookie cut at the limit would no longer match its value.
+    description = scrub((info.get("description") or "").strip(), result.secrets)
     if description:
         if len(description) > DESCRIPTION_LIMIT:
             description = description[:DESCRIPTION_LIMIT] + " […]"
