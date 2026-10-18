@@ -205,6 +205,71 @@ Other knobs (passed to `scripts/watch.py`):
 - **Long-video accuracy depends on the detail mode.** On the capped modes (`efficient`, default `balanced`) coverage thins out past ~10 minutes — the frame cap spreads across the whole clip, so the script prints a "sparse scan" warning and you're better off re-running focused with `--start`/`--end`. `token-burner` lifts the cap and keeps *every* scene-change frame across the full video, so it stays complete on longer clips at the cost of more image tokens. The 10-minute mark is guidance for the capped modes, not a hard ceiling.
 - **Detail is one dial.** Defaults are balanced: scene-aware frames, 2 fps max, 100-frame cap. Use `--detail efficient` for a fast 50-frame keyframe pass, or `--detail token-burner` for uncapped scene candidates. Set `WATCH_DETAIL` in `~/.config/watch/.env` to change the default.
 
+## MCP local
+
+Uma stack Docker isolada (projeto Compose `watch-mcp`) expõe o `/watch` como servidor MCP para o Claude Desktop: você cola um link de reel/vídeo (Instagram, TikTok, YouTube) e o Claude recebe metadados, legenda do post, transcrição com timestamps e frames. A transcrição roda num Whisper próprio (speaches, CPU) e o áudio não sai da máquina.
+
+- `watch-whisper` (`docker-compose.yml`): speaches `0.8.3-cpu` com tag e digest fixos, sem portas publicadas, rede `watch-mcp-net`, modelos no volume `watch-mcp-models`, descarrega modelos ociosos após 120 s.
+- `watch-mcp:latest` (`Dockerfile`, `mcp_server.py`): o servidor MCP (stdio). O Claude Desktop o inicia sob demanda com `docker run -i --rm` e ele fala com o `watch-whisper` pela rede.
+
+### Subir a stack
+
+```powershell
+docker compose -p watch-mcp up -d          # sobe o watch-whisper
+docker build -t watch-mcp:latest .         # imagem do servidor MCP
+```
+
+Na primeira vez, baixe os modelos pela API do próprio serviço:
+
+```powershell
+docker exec watch-mcp-whisper curl -s -X POST http://localhost:8000/v1/models/Systran/faster-whisper-small
+```
+
+A entrada `watch` em `%APPDATA%\Claude\claude_desktop_config.json` roda o `docker run` com `--network watch-mcp-net --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges --memory 2g --pids-limit 256`, sem portas publicadas (o gerador está em `tests/e2e/desktop_entry.py`). Reinicie o Claude Desktop depois de mudar a configuração.
+
+### Ferramentas
+
+- `watch_video(url, question?, start?, end?, detail="balanced", max_frames=24)`: devolve um texto com metadados, transcrição e a lista de frames (`t=MM:SS`), seguido dos frames em JPEG (lado maior de 512 px) em ordem temporal. Envia no máximo ~800 KB de imagens (em base64); se passar disso, reduz os frames uniformemente e avisa no texto.
+- `transcribe_video(url)`: só o texto, sem frames.
+
+### Rebuild quando o yt-dlp quebrar
+
+Instagram, TikTok e YouTube mudam com frequência e quebram versões antigas do yt-dlp. O `yt-dlp` não tem versão fixada de propósito, então um rebuild sem cache baixa a versão mais nova:
+
+```powershell
+docker build --no-cache -t watch-mcp:latest .
+```
+
+### Cookies do Instagram (opcional)
+
+Reels públicos costumam funcionar sem login. Quando o Instagram exigir login, a ferramenta responde explicando isso. Nesse caso, exporte os cookies de uma conta **secundária** (nunca a principal) em formato Netscape e salve em:
+
+```
+%USERPROFILE%\.config\watch\secrets\cookies.txt
+```
+
+A pasta é montada read-only no container como `/secrets` (montar a pasta, e não o arquivo, permite que o servidor suba sem cookies). O arquivo é lido a cada chamada, então não é preciso reiniciar nada. O servidor passa ao yt-dlp uma cópia privada na área temporária da chamada, apagada no fim, e nunca registra cookies em log nem na saída. O mesmo arquivo também ajuda no YouTube.
+
+### Trocar o modelo do Whisper
+
+O padrão é `Systran/faster-whisper-small`, porque o `medium` transcreve melhor em português mas é cerca de 3,5× mais lento nesta CPU. Para trocar:
+
+1. Baixe o modelo: `docker exec watch-mcp-whisper curl -s -X POST http://localhost:8000/v1/models/<modelo>`
+2. Mude `-e WATCH_WHISPER_MODEL=<modelo>` na entrada `watch` do `claude_desktop_config.json` e reinicie o Claude Desktop.
+
+`Systran/faster-whisper-medium` já está no volume. CPU e memória do serviço ficam em `docker-compose.yml` (8 CPUs, 4 GB).
+
+### Segurança
+
+Só URLs `http`/`https` para endereços públicos são aceitas. Todo acesso do yt-dlp passa por um proxy local (`netguard.py`) que confere de novo cada destino, inclusive redirecionamentos e CDNs, e conecta no IP já verificado, o que impede DNS rebinding. O vídeo pode ter até 15 min, até 500 MB de download e 1 GB de área temporária, e cada chamada tem tempo limite. A variável `WATCH_MCP_TEST_ALLOW_HOSTS` existe só para os testes de ponta a ponta e fica vazia por padrão. Detalhes e decisões estão em [NOTES-mcp.md](NOTES-mcp.md).
+
+### Testes de ponta a ponta
+
+```powershell
+.venv\Scripts\python tests\e2e\e2e_offline.py --work <pasta-temp>                 # vídeo sintético pt-BR, rede interna
+.venv\Scripts\python tests\e2e\e2e_mcp_stdio.py --url <URL> --out <pasta-temp>    # protocolo MCP real via stdio
+```
+
 ## Structure
 
 ```
