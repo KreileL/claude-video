@@ -526,15 +526,17 @@ async def run_watch(
                 info = {**info, "duration": float(m.group("s"))}
         result = RunResult(info=info, frames=parse_frames(stdout, run_dir / "frames"), secrets=secrets)
         result.segments, result.transcript_source = read_transcript(run_dir)
+        failed = False
         for line in stderr.splitlines():
             if line.strip() == NO_SPEECH_LINE:
                 result.no_speech = True  # silence or music: not an error
             elif "whisper fallback failed" in line:
+                failed = True
                 result.warnings.append(f"Transcrição Whisper falhou: {scrub(line.split('failed:', 1)[-1].strip(), secrets)}")
             elif "no audio stream found" in line:
                 result.no_audio = True
-            elif "no audio stream found" in line:
-                result.warnings.append("O vídeo não tem trilha de áudio.")
+        if failed:
+            result.no_speech = False  # a real failure always wins over "no speech"
         return result, work
     except BaseException:
         cleanup(work)

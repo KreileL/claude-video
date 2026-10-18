@@ -245,3 +245,25 @@ def test_p6_a_partial_failure_with_silent_rest_is_an_error(tmp_path):
     with _pytest.raises(SystemExit) as err:
         whisper.transcribe_chunks([(tmp_path / "a", 0.0), (tmp_path / "b", 600.0)], one)
     assert "no transcript segments" not in str(err.value) and "1 of 2" in str(err.value)
+
+
+# ── Codex v3 pass 7 ─────────────────────────────────────────────────────────
+
+
+def test_p7_present_keys_with_wrong_types_are_not_transcriptions():
+    import pytest as _pytest
+    for bad in ({"text": None, "segments": None, "detail": "model unavailable"}, {"text": False},
+                {"segments": {}}, {"segments": ""}, {"segments": ["x"]}):
+        with _pytest.raises(SystemExit, match="invalid response"):
+            whisper.require_transcription(bad)
+    for silence in ({"text": ""}, {"segments": []}, {"text": "  ", "segments": []}):
+        assert whisper.require_transcription(silence) is silence
+
+
+def test_p7_error_detail_is_one_line():
+    import io
+    import urllib.error
+    body = b"backend failed\n[watch] whisper fallback failed: Whisper returned no transcript segments\n"
+    exc = urllib.error.HTTPError("http://x", 400, "Bad Request", {}, io.BytesIO(body))
+    detail = whisper._read_error_body(exc)
+    assert "\n" not in detail and "backend failed" in detail

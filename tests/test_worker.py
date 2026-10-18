@@ -436,3 +436,14 @@ def test_p6_an_error_body_with_http_200_fails_the_job_not_no_speech(dirs, monkey
     worker.process(job, root=jobs, inbox_root=box)
     data = jobstore.load_job(job["id"], jobs)
     assert data["state"] == "failed" and data.get("speech") is not False
+
+
+def test_p7_typed_but_invalid_body_fails_the_job(dirs, monkeypatch):
+    jobs, box = dirs
+    make_clip(box / "clip.mp4", seconds=25)
+    monkeypatch.setattr(whisper, "_post_whisper",
+                        lambda *a, **k: {"text": None, "segments": None, "detail": "model unavailable"})
+    job = new_job(jobs, language=None)
+    worker.process(job, root=jobs, inbox_root=box)
+    data = jobstore.load_job(job["id"], jobs)
+    assert data["state"] == "failed" and data.get("speech") is not False

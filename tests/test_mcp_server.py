@@ -609,3 +609,11 @@ def test_p6_auto_never_inherits_a_forced_language_from_the_environment(fake_pipe
     monkeypatch.setattr(mcp_server, "run_process", _proc_with_stderr("", seen))
     run(mcp_server.watch_video("http://public.test/x", detail="transcript"))
     assert "WATCH_WHISPER_LANGUAGE" not in seen[-1]["env"]
+
+
+def test_p7_any_real_failure_wins_over_no_speech(fake_pipeline, monkeypatch):
+    monkeypatch.setattr(mcp_server, "run_process", _proc_with_stderr(
+        "[watch] whisper fallback failed: Whisper request failed: HTTP Error 400 — backend failed\n"
+        "[watch] whisper fallback failed: Whisper returned no transcript segments\n"))
+    with pytest.raises(ToolError, match="Nenhuma transcrição"):
+        run(mcp_server.transcribe_video("http://public.test/x"))

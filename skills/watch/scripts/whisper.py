@@ -440,7 +440,8 @@ def _read_error_body(exc: urllib.error.HTTPError) -> str:
     if not body:
         return ""
     try:
-        return f" — {body.decode('utf-8', errors='replace')[:400]}"
+        # One line: a multi-line body must not be able to forge a status line of watch.py.
+        return f" — {' '.join(body.decode('utf-8', errors='replace').split())[:400]}"
     except Exception:
         return ""
 
@@ -476,7 +477,11 @@ def shift_segments(segments: list[dict], offset_seconds: float) -> list[dict]:
 def require_transcription(data) -> dict:
     """A body that is really a transcription: an error object (even with HTTP 200)
     must not read as "no speech" (MCP v3: silence is reported, errors fail)."""
-    if not isinstance(data, dict) or "error" in data or not ("segments" in data or "text" in data):
+    valid = (isinstance(data, dict) and "error" not in data and ("segments" in data or "text" in data)
+             and ("text" not in data or isinstance(data["text"], str))
+             and ("segments" not in data or (isinstance(data["segments"], list)
+                                            and all(isinstance(s, dict) for s in data["segments"]))))
+    if not valid:
         raise SystemExit("Whisper returned an invalid response (no transcription in it)")
     return data
 
@@ -586,6 +591,10 @@ LANGUAGE_NAMES = {  # OpenAI-style servers answer full names, faster-whisper one
     "swedish": "sv", "ukrainian": "uk", "greek": "el", "hebrew": "he", "catalan": "ca",
     "czech": "cs", "danish": "da", "finnish": "fi", "norwegian": "no", "romanian": "ro",
     "hungarian": "hu", "indonesian": "id", "vietnamese": "vi", "thai": "th", "galician": "gl",
+    "afrikaans": "af", "malay": "ms", "persian": "fa", "bulgarian": "bg", "croatian": "hr",
+    "serbian": "sr", "slovak": "sk", "slovenian": "sl", "lithuanian": "lt", "latvian": "lv",
+    "estonian": "et", "tagalog": "tl", "urdu": "ur", "bengali": "bn", "tamil": "ta",
+    "basque": "eu", "welsh": "cy", "swahili": "sw", "icelandic": "is", "armenian": "hy",
 }
 
 
