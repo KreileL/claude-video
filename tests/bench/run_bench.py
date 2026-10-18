@@ -31,7 +31,7 @@ DATA = HERE / "data"
 TTS_DIR = DATA / "tts"
 REAL_DIR = DATA / "real"
 RESULTS = DATA / "results"
-BASE = "http://watch-whisper:8000"
+BASE = os.environ.get("WATCH_BENCH_BASE", "http://watch-whisper:8000")
 # Kokoro's phonemizer dlopens a copy of libespeak-ng from /tmp, which the
 # hardened watch-whisper (noexec tmpfs) refuses; synthesis can point at a
 # throwaway speaches container instead (see README.md).

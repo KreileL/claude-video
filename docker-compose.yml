@@ -113,8 +113,7 @@ services:
       WATCH_WHISPER_TIMEOUT: "1800"
       # Chosen by the pt-BR benchmark (NOTES-mcp.md, "v2").
       WATCH_MODEL_FAST: Systran/faster-whisper-small
-      WATCH_MODEL_ACCURATE: Systran/faster-whisper-medium
-      WATCH_PTBR_PROMPT: "1"
+      WATCH_MODEL_ACCURATE: deepdml/faster-whisper-large-v3-turbo-ct2
       # Limits (defaults shown): 4 h of media, 4 GiB per download, 8 h per job,
       # 7-day retention, 20 GiB for the whole cache.
       WATCH_JOB_MAX_DURATION: "14400"

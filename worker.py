@@ -55,10 +55,16 @@ MAX_JOBS_BYTES = int(os.environ.get("WATCH_JOBS_MAX_BYTES", str(20 * 1024**3)))
 CHUNK_SECONDS = float(os.environ.get("WATCH_CHUNK_SECONDS", "300"))
 POLL_SECONDS = float(os.environ.get("WATCH_WORKER_POLL", "2"))
 CLEANUP_EVERY = 600.0
-# Set from the pt-BR benchmark (NOTES-mcp.md, "v2"); overridable per deployment.
+# Chosen by the pt-BR benchmark (NOTES-mcp.md, "v2"); overridable per deployment.
 MODEL_FAST = os.environ.get("WATCH_MODEL_FAST", "Systran/faster-whisper-small")
-MODEL_ACCURATE = os.environ.get("WATCH_MODEL_ACCURATE", "Systran/faster-whisper-medium")
-USE_PROMPT = os.environ.get("WATCH_PTBR_PROMPT", "1") != "0"
+MODEL_ACCURATE = os.environ.get("WATCH_MODEL_ACCURATE", "deepdml/faster-whisper-large-v3-turbo-ct2")
+# Seconds of compute per second of audio measured on this CPU (8 cores, warm):
+# the ETA before the first chunk of a run has finished.
+SPEED_HINT = {
+    "Systran/faster-whisper-small": 0.20,
+    "Systran/faster-whisper-medium": 0.57,
+    "deepdml/faster-whisper-large-v3-turbo-ct2": 0.53,
+}
 SHORT_SECONDS = 15 * 60  # quality="auto": up to this, the fast model
 PROMPT_PTBR = (
     "Transcrição em português do Brasil, com pontuação e grafia brasileira: "
@@ -242,13 +248,14 @@ def pick_model(quality: str, duration: float) -> str:
 
 
 def build_prompt(language: str | None, terms: list[str]) -> str | None:
-    """Brazilian-Portuguese context plus the caller's terms (pt jobs only)."""
-    if language != "pt" or not USE_PROMPT:
-        return " ".join(terms)[:PROMPT_LIMIT] or None if terms else None
-    prompt = PROMPT_PTBR
-    if terms:
-        prompt += " Termos: " + ", ".join(terms) + "."
-    return prompt[:PROMPT_LIMIT]
+    """Initial prompt, only when the caller gave terms (the benchmark: the
+    Brazilian context alone did not help consistently; with the terms, names
+    and jargon improved). pt jobs get the Brazilian context in front of them."""
+    if not terms:
+        return None
+    if language != "pt":
+        return ", ".join(terms)[:PROMPT_LIMIT]
+    return f"{PROMPT_PTBR} Termos: {', '.join(terms)}."[:PROMPT_LIMIT]
 
 
 def scale_filter() -> str:
@@ -578,7 +585,7 @@ def transcribe(job: Job) -> None:
             continue  # finished before a restart (a corrupt file is redone)
         done_audio = sum(e - s for s, e in chunks[:i])
         rate = fresh_audio / (time.monotonic() - started) if fresh_audio else None
-        eta = (duration - done_audio) / rate if rate else None
+        eta = (duration - done_audio) / rate if rate else (duration - done_audio) * SPEED_HINT.get(model, 0.6)
         job.update(stage=f"transcrevendo ({i + 1}/{len(chunks)})", chunks_done=i,
                    progress=round(30 + 70 * done_audio / max(duration, 1), 1), eta_seconds=eta)
         piece = cut_audio(job, start, end, f"chunk_{i:04d}")

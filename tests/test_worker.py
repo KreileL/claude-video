@@ -219,6 +219,8 @@ def test_model_policy_and_prompt():
     assert prompt.startswith(worker.PROMPT_PTBR) and "Embrapa, Uberlândia" in prompt
     assert len(worker.build_prompt("pt", ["x" * 50] * 40)) <= worker.PROMPT_LIMIT
     assert worker.build_prompt("en", []) is None
+    assert worker.build_prompt("pt", []) is None  # no terms, no prompt (benchmark)
+    assert worker.build_prompt("en", ["Embrapa"]) == "Embrapa"
 
 
 def test_url_job_downloads_through_proxy_and_keeps_no_cookies(dirs, tmp_path, monkeypatch):
