@@ -46,10 +46,18 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from frames import format_time  # noqa: E402
 from transcribe import format_transcript  # noqa: E402
-from whisper import DEFAULT_LOCAL_URL, URL_KEY  # noqa: E402
+from whisper import local_endpoint  # noqa: E402
 
 MAX_DURATION_SECONDS = 15 * 60
 MAX_FILESIZE = "500M"
+# Hard cap enforced by the egress proxy on every byte yt-dlp receives (video,
+# audio, subtitles, fragments). --max-filesize above only works when the server
+# sends Content-Length.
+MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
+# ffmpeg input protocols when yt-dlp delegates a download to it: http(s) go
+# through the egress proxy (yt-dlp sets http_proxy); ftp, rtmp, rtsp, file and
+# the rest would not, so they are refused.
+FFMPEG_INPUT_WHITELIST = "http,https,tls,tcp,crypto"
 # Images are budgeted on their base64 size — what actually travels in the
 # tool result. A 90 s reel at the default 24 frames lands well under it.
 IMAGE_BUDGET_BYTES = 800 * 1024
@@ -63,7 +71,14 @@ WHISPER_TIMEOUT = os.environ.get("WATCH_WHISPER_TIMEOUT", "600")
 PROGRESS_EVERY = 10.0
 
 STACK_HINT = "rode docker compose -p watch-mcp up -d"
+COOKIE_JAR_ERROR = (
+    "O yt-dlp não conseguiu usar o cookies.txt (formato Netscape inválido?). Verifique o arquivo."
+)
 TIME_RE = re.compile(r"^\d{1,2}(:\d{1,2}){0,2}(\.\d{1,3})?$")
+FRAME_NAME_RE = re.compile(r"^(frame|cue)_\d{4}\.jpg$")
+JPEG_MAGIC = b"\xff\xd8\xff"
+NETSCAPE_LINE_RE = re.compile(r"^[^\t\n]*(?:\t[^\t\n]*){6}$", re.M)
+COOKIE_HEADER_RE = re.compile(r"(?im)^(.*?\b(?:set-)?cookies?\s*[:=]).*$")
 FRAME_LINE_RE = re.compile(r"^- `(?P<path>[^`]+)` \(t=(?P<t>[0-9:]+), reason=[^)]*\)$")
 DURATION_LINE_RE = re.compile(r"^- \*\*Duration:\*\* \S+ \((?P<s>[0-9.]+)s\)$", re.M)
 YOUTUBE_BOT_MARKERS = ("confirm you’re not a bot", "confirm you're not a bot", "http error 429")
@@ -101,6 +116,7 @@ class RunResult:
     segments: list[dict] = field(default_factory=list)
     transcript_source: str | None = None
     warnings: list[str] = field(default_factory=list)
+    secrets: frozenset[str] = frozenset()
 
 
 # ── input validation ────────────────────────────────────────────────────────
@@ -137,8 +153,7 @@ def frame_width(width: int | None, height: int | None) -> int:
 
 
 def whisper_health_url() -> str:
-    endpoint = os.environ.get(URL_KEY) or DEFAULT_LOCAL_URL
-    parts = urlsplit(endpoint)
+    parts = urlsplit(local_endpoint())
     return f"{parts.scheme}://{parts.netloc}/health"
 
 
@@ -166,20 +181,49 @@ def ytdlp_args(proxy_url: str, cookies: Path | None) -> list[str]:
         "--socket-timeout", "30",
         "--max-filesize", MAX_FILESIZE,
         "--match-filter", f"duration <=? {MAX_DURATION_SECONDS} & !is_live",
+        "--downloader-args", f"ffmpeg_i:-protocol_whitelist {FFMPEG_INPUT_WHITELIST}",
     ]
     if cookies is not None:
         args += ["--cookies", str(cookies)]
     return args
 
 
-def scrub(text: str) -> str:
-    """Drop anything that looks like a cookie value from text we show."""
-    return re.sub(r"(?i)(cookie[s]?\s*[:=]\s*)\S+", r"\1<redacted>", text)
+def cookie_secrets(path: Path | None) -> frozenset[str]:
+    """The cookie values in a Netscape cookies.txt, to redact wherever they appear."""
+    if path is None or not path.is_file():
+        return frozenset()
+    values = set()
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.removeprefix("#HttpOnly_")
+        fields = line.split("\t")
+        if not line.startswith("#") and len(fields) >= 7 and len(fields[6].strip()) >= 4:
+            values.add(fields[6].strip())
+    return frozenset(values)
 
 
-def tail(text: str, lines: int = 8) -> str:
+def secrets_from_args(args: list[str]) -> frozenset[str]:
+    if "--cookies" in args:
+        return cookie_secrets(Path(args[args.index("--cookies") + 1]))
+    return frozenset()
+
+
+def scrub(text: str, secrets: frozenset[str] = frozenset()) -> str:
+    """Remove cookie material from text we show: the jar's own values wherever
+    they appear, whole Netscape cookie lines, and Cookie/Set-Cookie headers."""
+    for value in sorted(secrets, key=len, reverse=True):
+        text = text.replace(value, "<redacted>")
+    text = NETSCAPE_LINE_RE.sub("<cookie line redacted>", text)
+    return COOKIE_HEADER_RE.sub(r"\1 <redacted>", text)
+
+
+def tail(text: str, secrets: frozenset[str] = frozenset(), lines: int = 8) -> str:
     kept = [ln for ln in text.strip().splitlines() if ln.strip()][-lines:]
-    return scrub("\n".join(kept))
+    return scrub("\n".join(kept), secrets)
+
+
+def cookie_jar_problem(stderr: str) -> bool:
+    low = stderr.lower()
+    return "cookie" in low and any(w in low for w in ("invalid", "failed to load", "could not load", "malformed"))
 
 
 async def run_process(
@@ -224,21 +268,31 @@ async def run_process(
                     pass
     except asyncio.TimeoutError:
         _kill(proc)
-        communicate.cancel()
+        try:  # with the group dead the pipes hit EOF: reap it, close the transport
+            await asyncio.wait_for(communicate, 5)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            communicate.cancel()
         raise ToolError(f"Tempo limite excedido ({timeout:.0f}s) em: {label}") from None
     except BaseException:
         _kill(proc)
         communicate.cancel()
         raise
+    finally:
+        # Even after a clean exit, strays (an ffmpeg left by yt-dlp) must not
+        # outlive the call.
+        _kill(proc)
 
 
 def _kill(proc: asyncio.subprocess.Process) -> None:
-    if proc.returncode is not None:
-        return
+    """Kill the child's whole process group (POSIX), even if the child itself
+    already exited: its descendants can still hold the pipes open.
+
+    On Windows (local development only) just the child is killed.
+    """
     try:
         if os.name == "posix":
             os.killpg(proc.pid, signal.SIGKILL)
-        else:
+        elif proc.returncode is None:
             proc.kill()
     except (ProcessLookupError, PermissionError):
         pass
@@ -286,15 +340,19 @@ def site_block_message(url: str, stderr: str) -> str | None:
     return login_wall_message(url, stderr) or youtube_block_message(url, stderr)
 
 
-async def preflight(url: str, extra_args: list[str], work: Path, ctx: Context | None) -> dict:
+async def preflight(
+    url: str, extra_args: list[str], work: Path, ctx: Context | None, timeout: float | None = None,
+) -> dict:
     """Metadata only: duration limit and login walls, before any download."""
+    # Read before yt-dlp runs: it rewrites the jar on exit, dropping bad entries.
+    secrets = secrets_from_args(extra_args)
     argv = [
         "yt-dlp", *extra_args,
         "--skip-download", "--dump-single-json", "--no-playlist", "--no-warnings",
         "--", url,
     ]
     code, stdout, stderr = await run_process(
-        argv, env=child_env({}), cwd=work, timeout=YTDLP_TIMEOUT, ctx=ctx, label="lendo metadados",
+        argv, env=child_env({}), cwd=work, timeout=timeout or YTDLP_TIMEOUT, ctx=ctx, label="lendo metadados",
     )
     info: dict = {}
     if code == 0 and stdout.strip():
@@ -303,10 +361,12 @@ async def preflight(url: str, extra_args: list[str], work: Path, ctx: Context | 
         except json.JSONDecodeError:
             info = {}
     if not info:
+        if secrets and cookie_jar_problem(stderr):
+            raise ToolError(COOKIE_JAR_ERROR)
         wall = site_block_message(url, stderr)
         if wall:
             raise ToolError(wall)
-        raise ToolError(f"yt-dlp não conseguiu ler este vídeo:\n{tail(stderr) or f'exit {code}'}")
+        raise ToolError(f"yt-dlp não conseguiu ler este vídeo:\n{tail(stderr, secrets) or f'exit {code}'}")
     if info.get("_type") == "playlist":
         entries = [e for e in info.get("entries") or [] if e]
         if not entries:
@@ -323,12 +383,27 @@ async def preflight(url: str, extra_args: list[str], work: Path, ctx: Context | 
     return info
 
 
-def parse_frames(stdout: str) -> list[Frame]:
+def parse_frames(stdout: str, frames_dir: Path) -> list[Frame]:
+    """Frame list from watch.py's report — only from its "## Frames" section and
+    only files that really are this call's frames.
+
+    The report also carries remote text (title, uploader, captions) that can
+    forge a frame line, so every path must resolve (symlinks included) to a
+    frame_NNNN.jpg / cue_NNNN.jpg directly inside frames_dir.
+    """
+    report = stdout.replace("\r\n", "\n")
+    if "\n## Frames\n" not in report:
+        return []
+    section = report.split("\n## Frames\n", 1)[1].split("\n## Transcript\n", 1)[0]
+    root = frames_dir.resolve()
     frames = []
-    for line in stdout.splitlines():
+    for line in section.splitlines():
         m = FRAME_LINE_RE.match(line.strip())
-        if m:
-            frames.append(Frame(Path(m.group("path")), m.group("t")))
+        if not m:
+            continue
+        path = Path(m.group("path")).resolve()
+        if path.parent == root and FRAME_NAME_RE.match(path.name) and path.is_file():
+            frames.append(Frame(path, m.group("t")))
     return frames
 
 
@@ -350,6 +425,14 @@ async def run_watch(
     ctx: Context | None,
 ) -> tuple[RunResult, Path]:
     """Validate, preflight and run watch.py. The caller deletes the work dir."""
+    deadline = time.monotonic() + CALL_TIMEOUT
+
+    def remaining() -> float:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise ToolError(f"Tempo limite total excedido ({CALL_TIMEOUT:.0f}s)")
+        return left
+
     url = check_url(url)
     start, end = check_time("start", start), check_time("end", end)
     await asyncio.to_thread(check_whisper)
@@ -363,10 +446,15 @@ async def run_watch(
             cookies = work / "cookies.txt"
             shutil.copyfile(COOKIES_PATH, cookies)
             os.chmod(cookies, 0o600)
+        secrets = cookie_secrets(cookies)
 
-        with netguard.EgressProxy() as proxy:
+        with netguard.EgressProxy(max_bytes=MAX_DOWNLOAD_BYTES) as proxy:
             extra = ytdlp_args(proxy.url, cookies)
-            info = await preflight(url, extra, work, ctx)
+            try:
+                info = await preflight(url, extra, work, ctx, timeout=min(YTDLP_TIMEOUT, remaining()))
+            except ToolError:
+                _check_budget(proxy)
+                raise
 
             run_dir = work / "run"
             argv = [
@@ -384,29 +472,52 @@ async def run_watch(
                 "WATCH_YTDLP_ARGS": json.dumps(extra),
                 "WATCH_YTDLP_TIMEOUT": str(YTDLP_TIMEOUT),
             })
-            code, stdout, stderr = await run_process(
-                argv, env=env, cwd=work, timeout=CALL_TIMEOUT, ctx=ctx, label="baixando e analisando",
-            )
+            try:
+                code, stdout, stderr = await run_process(
+                    argv, env=env, cwd=work, timeout=remaining(), ctx=ctx, label="baixando e analisando",
+                )
+            finally:
+                _check_budget(proxy)
         if code != 0:
+            if secrets and cookie_jar_problem(stderr):
+                raise ToolError(COOKIE_JAR_ERROR)
             wall = site_block_message(url, stderr)
-            raise ToolError(wall or f"watch.py falhou (exit {code}):\n{tail(stderr)}")
+            raise ToolError(wall or f"watch.py falhou (exit {code}):\n{tail(stderr, secrets)}")
 
         if not info.get("duration"):
             # Some extractors (Instagram) omit it; watch.py measured the file.
             m = DURATION_LINE_RE.search(stdout)
             if m and float(m.group("s")) > 0:
                 info = {**info, "duration": float(m.group("s"))}
-        result = RunResult(info=info, frames=parse_frames(stdout))
+        result = RunResult(info=info, frames=parse_frames(stdout, run_dir / "frames"), secrets=secrets)
         result.segments, result.transcript_source = read_transcript(run_dir)
         for line in stderr.splitlines():
             if "whisper fallback failed" in line:
-                result.warnings.append(f"Transcrição Whisper falhou: {scrub(line.split('failed:', 1)[-1].strip())}")
+                result.warnings.append(f"Transcrição Whisper falhou: {scrub(line.split('failed:', 1)[-1].strip(), secrets)}")
             elif "no audio stream found" in line:
                 result.warnings.append("O vídeo não tem trilha de áudio.")
         return result, work
     except BaseException:
-        shutil.rmtree(work, ignore_errors=True)
+        cleanup(work)
         raise
+
+
+def _check_budget(proxy: netguard.EgressProxy) -> None:
+    if proxy.exceeded:
+        raise ToolError(
+            f"O download passou do limite de {MAX_DOWNLOAD_BYTES // (1024 * 1024)} MB e foi interrompido."
+        )
+
+
+def cleanup(work: Path) -> None:
+    """Delete the per-call work dir; a failure is logged (path only), never silent."""
+    try:
+        shutil.rmtree(work)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"[watch-mcp] could not fully remove {work}: {type(exc).__name__}", file=sys.stderr)
+        shutil.rmtree(work, ignore_errors=True)
 
 
 # ── output ──────────────────────────────────────────────────────────────────
@@ -426,7 +537,13 @@ def fit_budget(sizes: list[int], budget: int) -> list[int]:
 
 
 def encode_frames(frames: list[Frame], budget: int) -> tuple[list[Frame], list[str], str | None]:
-    encoded = [base64.b64encode(f.path.read_bytes()).decode("ascii") for f in frames]
+    kept, encoded = [], []
+    for frame in frames:
+        data = frame.path.read_bytes()
+        if data.startswith(JPEG_MAGIC):  # only real JPEGs leave the server
+            kept.append(frame)
+            encoded.append(base64.b64encode(data).decode("ascii"))
+    frames = kept
     picks = fit_budget([len(e) for e in encoded], budget)
     note = None
     if len(picks) < len(frames):
@@ -518,18 +635,20 @@ async def watch_video(
         raise ToolError(f"max_frames deve estar entre 1 e {MAX_FRAMES_LIMIT}")
     result, work = await run_watch(url, detail=detail, max_frames=max_frames, start=start, end=end, ctx=ctx)
     try:
-        frames, encoded, note = encode_frames(result.frames, IMAGE_BUDGET_BYTES)
+        frames, encoded, note = [], [], None
+        if detail != "transcript":
+            frames, encoded, note = encode_frames(result.frames, IMAGE_BUDGET_BYTES)
         if note:
             result.warnings.append(note)
         text = build_text(
             url, result, question=question, detail=detail, start=start, end=end,
             frames=None if detail == "transcript" else frames,
         )
-        content: list[TextContent | ImageContent] = [TextContent(type="text", text=text)]
+        content: list[TextContent | ImageContent] = [TextContent(type="text", text=scrub(text, result.secrets))]
         content += [ImageContent(type="image", data=data, mime_type="image/jpeg") for data in encoded]
         return content
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        cleanup(work)
 
 
 @mcp.tool()
@@ -545,9 +664,10 @@ async def transcribe_video(url: str, ctx: Context | None = None) -> str:
                 "Nenhuma transcrição obtida: o vídeo não tem legendas e o Whisper não reconheceu fala."
                 + (f" ({'; '.join(result.warnings)})" if result.warnings else "")
             )
-        return build_text(url, result, question=None, detail="transcript", start=None, end=None, frames=None)
+        text = build_text(url, result, question=None, detail="transcript", start=None, end=None, frames=None)
+        return scrub(text, result.secrets)
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        cleanup(work)
 
 
 if __name__ == "__main__":
