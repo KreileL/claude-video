@@ -312,3 +312,29 @@ def test_p1_failed_reply_keeps_enqueuing_and_tracking(monkeypatch):
     tb.handle_update(update, api=FlakyApi(), state=state, enqueue=enqueue)
     assert queued == ["https://youtu.be/a", "https://youtu.be/b"]
     assert [p["job_id"] for p in state["pending"]] == [f"{1:032x}", f"{2:032x}"]
+
+
+def test_links_from_telegram_use_language_detection_and_hide_internal_errors():
+    import types
+    calls = []
+
+    class ToolError(Exception):
+        pass
+
+    def enqueue_analysis(**kw):
+        calls.append(kw)
+        if kw["source"].endswith("bad"):
+            raise ToolError("URL recusada: host privado")
+        if kw["source"].endswith("bug"):
+            raise KeyError("/app/segredo/interno")
+        return {"id": "a" * 32}, False
+
+    fake = types.SimpleNamespace(enqueue_analysis=enqueue_analysis, ToolError=ToolError)
+    enqueue = tb.make_enqueue(fake)
+    enqueue("https://www.instagram.com/reel/x/")
+    assert calls[0] == {"source": "https://www.instagram.com/reel/x/", "language": "auto", "origin": "telegram"}
+    with pytest.raises(ToolError, match="URL recusada"):
+        enqueue("https://x/bad")
+    with pytest.raises(RuntimeError) as err:
+        enqueue("https://x/bug")
+    assert "segredo" not in str(err.value)

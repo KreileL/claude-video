@@ -298,19 +298,25 @@ def run(*, enqueue: Callable[[str], tuple[dict, bool]], api: Api | None = None,
                 _log(f"erro ao salvar estado: {type(exc).__name__}", api.token)
 
 
-def main() -> None:
-    api = Api(read_token())
-    import mcp_server  # lazy: heavy import, and keeps this module testable
-
+def make_enqueue(mcp_server) -> Callable[[str], tuple[dict, bool]]:
+    # language="auto": shared links come in any language, and forcing "pt" makes
+    # Whisper produce a bad Portuguese rendering of, e.g., an English reel.
     def enqueue(url: str) -> tuple[dict, bool]:
         try:
-            return mcp_server.enqueue_analysis(source=url, origin="telegram")
+            return mcp_server.enqueue_analysis(source=url, language="auto", origin="telegram")
         except mcp_server.ToolError:
             raise  # a user-facing reason (e.g. "URL recusada: ...")
         except Exception as exc:  # noqa: BLE001 - no internal details in the chat
             raise RuntimeError("erro interno ao enfileirar") from exc
 
-    run(enqueue=enqueue, api=api)
+    return enqueue
+
+
+def main() -> None:
+    api = Api(read_token())
+    import mcp_server  # lazy: heavy import, and keeps this module testable
+
+    run(enqueue=make_enqueue(mcp_server), api=api)
 
 
 if __name__ == "__main__":
