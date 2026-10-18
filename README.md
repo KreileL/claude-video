@@ -1,3 +1,16 @@
+## Sobre este fork
+
+Este fork do [bradautomates/claude-video](https://github.com/bradautomates/claude-video) acrescenta, para uso local no Windows com o Claude Desktop:
+
+- **Servidor MCP local em Docker:** as ferramentas `watch_video` e `transcribe_video` em container isolado (somente leitura, sem portas, sem privilégios).
+- **Whisper local com foco em pt-BR:** transcrição na própria máquina (speaches), com modelos escolhidos por benchmark em português do Brasil.
+- **Caixa de entrada:** arquivos de vídeo e áudio em `D:\Inbox`, lidos somente leitura.
+- **Vídeos longos em segundo plano:** um worker processa trabalhos de horas, com retomada, busca na transcrição e índice de cenas.
+
+Detalhes nas seções [MCP local](#mcp-local) e [MCP local v2](#mcp-local-v2). Todo o restante (a skill `/watch`) é do projeto original, de [bradautomates](https://github.com/bradautomates), a quem vai o crédito.
+
+---
+
 # /watch
 
 **Give Claude the ability to watch any video.**
