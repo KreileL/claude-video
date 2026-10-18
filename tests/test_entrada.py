@@ -190,38 +190,47 @@ def test_clean_orphans(root, tmp_path):
 
 # ---------- markdown ----------
 
+UNESCAPED_BRACKET = re.compile(r"(?<!\\)(?:\\\\)*[\[\]]")
+
+
 @pytest.mark.parametrize("text,gone", [
     ("<script>alert(1)</script>", "<script"),
     ("<SCRIPT\n>alert(1)</SCRIPT >", "alert"),
     ("<iframe src=x>hi</iframe>", "<iframe"),
     ("<iframe src=x>", "<iframe"),
     ("<img src=x onerror=y>", "<img"),
-    ("![[Secreto]]", "[["),
-    ("[[../x]]", "[["),
-    ("[[a]]", "]]"),
     ("[a](file:///etc/passwd)", "file:"),
-    ("[a](../../x.md)", "x.md"),
-    ("![i](https://evil/x.png)", "evil"),
     ("javascript:alert(1)", "javascript:"),
     ("see OBSIDIAN://open?vault=x", "OBSIDIAN:"),
     ("`$= dv.pages()`", "`$="),
-    ("[r]: file:///etc/passwd", "file:"),
 ])
 def test_sanitize_markdown_neutralizes(text, gone):
     assert gone not in entrada.sanitize_markdown(text)
 
 
+@pytest.mark.parametrize("text", [
+    "![[Secreto]]", "[[../x]]", "[a](../../x.md)", "![i](https://evil/x.png)", "[r]: file:///etc/passwd",
+    # Codex v3 pass 1: nested labels and reference images in a blockquote survived the old regexes.
+    "[ver [detalhes]](../../Segredos.md)", "> ![foto][ref]\n> [ref]: ../../Segredos.png",
+    "nota[^1]\n\n[^1]: ../x", "\\[x](../y.md)", "\\\\[x](../y.md)",
+])
+def test_sanitize_markdown_leaves_no_link_syntax(text):
+    out = entrada.sanitize_markdown(text)
+    assert not UNESCAPED_BRACKET.search(out), out
+
+
 def test_sanitize_markdown_fences_and_frontmatter():
-    out = entrada.sanitize_markdown("```dataviewjs\ndv.x()\n```\n~~~\nz")
-    assert "```" not in out and "~~~" not in out
+    fence = "`" * 3
+    out = entrada.sanitize_markdown(f"{fence}dataviewjs\ndv.x()\n{fence}\n~~~\nz\n- {fence}dataviewjs\n> ~~~js")
+    assert fence not in out and "~~~" not in out
     assert not entrada.sanitize_markdown("---\ntipo: x\n---").startswith("---")
     out = entrada.sanitize_markdown("a\r\nb\x00\x1b\u202e")
     assert out == "a\nb"
 
 
-def test_sanitize_markdown_keeps_http_link():
-    s = "[site](https://example.com) e texto normal"
-    assert entrada.sanitize_markdown(s) == s
+def test_sanitize_markdown_keeps_text_readable():
+    out = entrada.sanitize_markdown("[site](https://example.com) e texto normal")
+    assert "https://example.com" in out and "texto normal" in out and "site" in out
 
 
 def test_transcript_injection_is_plain_text():
@@ -264,7 +273,7 @@ def test_frontmatter_injection():
 
 def test_render_index_states():
     ok = entrada.render_index(_info())
-    assert "resumo: ok" in ok and "Resumo [00:01:00] ok" in ok and "Ver o resumo acima." in ok
+    assert "resumo: ok" in ok and r"Resumo \[00:01:00\] ok" in ok and "Ver o resumo acima." in ok
     assert "duracao: \"02:36:22\"" in ok
     assert "![01:02:03](frames/frame-01-02-03.jpg)" in ok and "Frames-chave (1)" in ok
     assert f'search_transcript(job_id="{JID}"' in ok

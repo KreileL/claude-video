@@ -296,31 +296,25 @@ def add_file(root: Path | None, folder: str, name: str, data: bytes | str) -> st
 # ---------- hostile text -> Markdown ----------
 
 _BLOCK_RE = re.compile(r"<\s*(script|style|iframe)\b.*?<\s*/\s*\1\s*>", re.I | re.S)
-_LINK_RE = re.compile(r"(!?)\[([^\]]*)\]\(([^)]*)\)")
-_SCHEME_RE = re.compile(r"\b(file|javascript|data|obsidian):", re.I)
-_FENCE_RE = re.compile(r"^((?:\s|>)*)(```|~~~)", re.M)
-_REFDEF_RE = re.compile(r"^(\s*)\[([^\]]*)\]:", re.M)
-
-
-def _link(m: re.Match) -> str:
-    bang, text, target = m.group(1), m.group(2), m.group(3)
-    t = target.strip().lower().replace("<", "").replace(">", "").replace("&lt;", "").replace("&gt;", "")
-    if bang or not t.startswith(("http://", "https://")):
-        return text  # no remote images, no local/other-scheme targets
-    return m.group(0)
+_SCHEME_RE = re.compile(r"\b(file|javascript|data|obsidian|vbscript):", re.I)
 
 
 def sanitize_markdown(text: object) -> str:
-    """Neutralize hostile text before it goes into a note body."""
+    """Neutralize hostile text before it goes into a note body.
+
+    Structural rather than link-matching: every backslash, "[" and "]" is
+    escaped, so no link, image, reference definition, footnote, wikilink or
+    embed can form, nested or not; "<" becomes an entity (no HTML); code fences
+    are removed anywhere (no Dataview/Templater blocks). The text stays readable.
+    """
     s = str(text).replace("\r\n", "\n").replace("\r", "\n")
     s = _drop_bad(s, keep="\n\t")
     s = _BLOCK_RE.sub("", s)
+    s = s.replace("\\", "\\\\")  # first, so the escapes below cannot be cancelled
     s = s.replace("<", "&lt;")
-    s = s.replace("[[", "[ [").replace("]]", "] ]")
-    s = _LINK_RE.sub(_link, s)
-    s = _REFDEF_RE.sub(r"\1\\[\2]:", s)
+    s = s.replace("[", "\\[").replace("]", "\\]")
     s = _SCHEME_RE.sub(lambda m: m.group(1) + " :", s)
-    s = _FENCE_RE.sub(lambda m: m.group(1) + "'''", s)
+    s = s.replace("`" * 3, "'''").replace("~~~", "'''")
     s = re.sub(r"`(\$?=)", r"` \1", s)  # Dataview inline queries
     return re.sub(r"\A-{3,}", "—", s)
 
@@ -441,6 +435,9 @@ def render_index(info: dict) -> str:
         out.append(sanitize_markdown(summary).strip())
     elif status == "desligado":
         out.append("> [!info] Resumo desligado para esta origem.")
+    elif info.get("resumo_erro"):
+        out.append("> [!warning] Resumo não gerado\n> O provedor recusou o pedido. Para tentar de novo: "
+                   f"`docker exec watch-mcp-worker-v3 python /app/worker.py export {job_id} --again`.")
     else:
         out.append("> [!info] Resumo pendente\n> O resumo automático ainda não foi gerado; "
                    "o worker tenta de novo e, quando conseguir, cria `Resumo.md` nesta pasta.")
