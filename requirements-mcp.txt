@@ -1,0 +1,6 @@
+# Runtime deps of the watch-mcp image (mcp_server.py). The skill itself is stdlib.
+mcp==2.3.0
+# Deliberately unpinned: Instagram/TikTok/YouTube break old yt-dlp releases, and
+# `docker build --no-cache` must pick up the newest one. `default` brings
+# yt-dlp-ejs and `deno` the JS runtime YouTube now requires.
+yt-dlp[default,deno]>=2026.8.19

@@ -1,0 +1,12 @@
+.git
+.venv
+.codex
+.claude
+dist
+tests
+**/__pycache__
+**/*.pyc
+.pytest_cache
+secrets
+*.env
+cookies*.txt
