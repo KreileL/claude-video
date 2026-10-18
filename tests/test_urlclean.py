@@ -30,8 +30,11 @@ from urlclean import clean_url  # noqa: E402
     ("https://www.tiktok.com/@canal/video/7345678901234567890?is_from_webapp=1&sender_device=pc&web_id=99",
      "https://www.tiktok.com/@canal/video/7345678901234567890"),
     ("https://vm.tiktok.com/ZMabc123/?_r=1&_t=8kXyz", "https://vm.tiktok.com/ZMabc123/"),
-    # Fragments go
-    ("https://vimeo.com/123?utm_campaign=x&h=abc#t=10", "https://vimeo.com/123?h=abc"),
+    # TikTok short forms recognized by yt-dlp (Codex v3 pass 7)
+    ("https://www.tiktok.com/t/ZTRC5xgJp/?share_iid=1&sec_user_id=2&checksum=3&timestamp=4&user_id=5&web_id=6",
+     "https://www.tiktok.com/t/ZTRC5xgJp/"),
+    ("https://www.tiktokv.com/share/video/7345678901234567890/?_t=x&share_link_id=y",
+     "https://www.tiktokv.com/share/video/7345678901234567890/"),
 ])
 def test_tracking_parameters_are_dropped(raw, clean):
     assert clean_url(raw) == clean
@@ -55,7 +58,6 @@ def test_functional_parameters_and_their_encoding_survive(url):
 
 
 def test_only_tracking_names_go_on_other_pages_and_the_rest_is_verbatim():
-    assert clean_url("https://example.com/v.mp4?fbclid=1&name=a%20b&utm_x=2") == "https://example.com/v.mp4?name=a%20b"
     assert clean_url("https://www.youtube.com/embed/live_stream?channel=UC1&si=x") == \
         "https://www.youtube.com/embed/live_stream?channel=UC1"
     assert clean_url("https://www.instagram.com/stories/user/123/?igsh=x&story_media_id=5") == \
@@ -65,3 +67,19 @@ def test_only_tracking_names_go_on_other_pages_and_the_rest_is_verbatim():
 def test_host_and_path_never_change():
     assert clean_url("https://www.instagram.com/reel/A_b-1/?igsh=1").startswith("https://www.instagram.com/reel/A_b-1/")
     assert clean_url("https://notyoutube.com/watch?v=1&si=2") == "https://notyoutube.com/watch?v=1&si=2"
+
+
+# ── Codex v3 pass 7 ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("url", [
+    "https://example.com/v.mp4?resource=a%20b&&signature=abc&",
+    "https://example.com/v.mp4?fbclid=1&name=a%20b&utm_x=2",  # other sites: not touched at all
+    "https://vimeo.com/123?utm_campaign=x&h=abc#t=10",
+])
+def test_other_sites_are_left_byte_for_byte(url):
+    assert clean_url(url) == url
+
+
+def test_empty_pieces_survive_when_a_tracking_piece_goes():
+    assert clean_url("https://www.youtube.com/embed/live_stream?channel=UC1&&si=x&") ==         "https://www.youtube.com/embed/live_stream?channel=UC1&&"
