@@ -268,3 +268,24 @@ def test_redirect_to_internal_host_is_blocked(local_stack):
     finally:
         redirect.shutdown()
         target.shutdown()
+
+
+def test_youtube_block_message():
+    err = "ERROR: [youtube] x: Sign in to confirm you’re not a bot. Use --cookies"
+    assert "anti-bot" in mcp_server.site_block_message("https://www.youtube.com/watch?v=x", err)
+    assert mcp_server.site_block_message("https://youtu.be/x", "ERROR: HTTP Error 429: Too Many Requests")
+    assert mcp_server.youtube_block_message("https://vimeo.com/1", err) is None
+
+
+def test_duration_falls_back_to_watch_report():
+    report = "- **Source:** u\n- **Duration:** 01:15 (75.3s)\n"
+    assert float(mcp_server.DURATION_LINE_RE.search(report).group("s")) == 75.3
+
+
+def test_author_handle_skips_numeric_ids():
+    result = mcp_server.RunResult(info={"uploader": "Leo Messi", "uploader_id": "427553890", "channel": "leomessi"})
+    text = mcp_server.build_text("u", result, question=None, detail="balanced", start=None, end=None, frames=[])
+    assert "Autor: Leo Messi (@leomessi)" in text
+    result = mcp_server.RunResult(info={"uploader": "X", "uploader_id": "123"})
+    text = mcp_server.build_text("u", result, question=None, detail="balanced", start=None, end=None, frames=[])
+    assert "- Autor: X\n" in text

@@ -65,6 +65,8 @@ PROGRESS_EVERY = 10.0
 STACK_HINT = "rode docker compose -p watch-mcp up -d"
 TIME_RE = re.compile(r"^\d{1,2}(:\d{1,2}){0,2}(\.\d{1,3})?$")
 FRAME_LINE_RE = re.compile(r"^- `(?P<path>[^`]+)` \(t=(?P<t>[0-9:]+), reason=[^)]*\)$")
+DURATION_LINE_RE = re.compile(r"^- \*\*Duration:\*\* \S+ \((?P<s>[0-9.]+)s\)$", re.M)
+YOUTUBE_BOT_MARKERS = ("confirm you’re not a bot", "confirm you're not a bot", "http error 429")
 INSTAGRAM_LOGIN_MARKERS = (
     "login required",
     "log in",
@@ -77,6 +79,7 @@ INSTAGRAM_LOGIN_MARKERS = (
 
 mcp = MCPServer(
     "watch",
+    version="0.2.0",
     instructions=(
         "Tools to watch a video from a URL (Instagram, TikTok, YouTube, ...): "
         "watch_video returns metadata, a timestamped transcript and frames; "
@@ -265,6 +268,24 @@ def login_wall_message(url: str, stderr: str) -> str | None:
     )
 
 
+def youtube_block_message(url: str, stderr: str) -> str | None:
+    host = (urlsplit(url).hostname or "").lower()
+    if not (host in ("youtu.be", "youtube.com") or host.endswith(".youtube.com")):
+        return None
+    low = stderr.lower()
+    if not any(marker in low for marker in YOUTUBE_BOT_MARKERS):
+        return None
+    return (
+        "O YouTube recusou temporariamente o download (anti-bot / HTTP 429 para este IP). "
+        "Tente de novo em alguns minutos. Se persistir, um cookies.txt (Netscape) de uma conta "
+        "secundária em %USERPROFILE%\\.config\\watch\\secrets\\cookies.txt também vale para o YouTube."
+    )
+
+
+def site_block_message(url: str, stderr: str) -> str | None:
+    return login_wall_message(url, stderr) or youtube_block_message(url, stderr)
+
+
 async def preflight(url: str, extra_args: list[str], work: Path, ctx: Context | None) -> dict:
     """Metadata only: duration limit and login walls, before any download."""
     argv = [
@@ -282,7 +303,7 @@ async def preflight(url: str, extra_args: list[str], work: Path, ctx: Context | 
         except json.JSONDecodeError:
             info = {}
     if not info:
-        wall = login_wall_message(url, stderr)
+        wall = site_block_message(url, stderr)
         if wall:
             raise ToolError(wall)
         raise ToolError(f"yt-dlp não conseguiu ler este vídeo:\n{tail(stderr) or f'exit {code}'}")
@@ -367,9 +388,14 @@ async def run_watch(
                 argv, env=env, cwd=work, timeout=CALL_TIMEOUT, ctx=ctx, label="baixando e analisando",
             )
         if code != 0:
-            wall = login_wall_message(url, stderr)
+            wall = site_block_message(url, stderr)
             raise ToolError(wall or f"watch.py falhou (exit {code}):\n{tail(stderr)}")
 
+        if not info.get("duration"):
+            # Some extractors (Instagram) omit it; watch.py measured the file.
+            m = DURATION_LINE_RE.search(stdout)
+            if m and float(m.group("s")) > 0:
+                info = {**info, "duration": float(m.group("s"))}
         result = RunResult(info=info, frames=parse_frames(stdout))
         result.segments, result.transcript_source = read_transcript(run_dir)
         for line in stderr.splitlines():
@@ -425,7 +451,10 @@ def build_text(
     lines = [f"# Vídeo: {info.get('title') or url}", "", f"- URL: {info.get('webpage_url') or url}"]
     author = info.get("uploader") or info.get("channel") or info.get("creator")
     if author:
-        handle = info.get("uploader_id") or info.get("channel_id")
+        # Instagram's uploader_id is numeric; its channel is the @handle.
+        handle = info.get("channel") or info.get("uploader_id")
+        if handle and str(handle).isdigit():
+            handle = None
         lines.append(f"- Autor: {author}" + (f" (@{handle})" if handle and handle != author else ""))
     if info.get("duration"):
         d = float(info["duration"])
