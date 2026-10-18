@@ -173,14 +173,22 @@ def check_whisper() -> None:
 # ── subprocesses ────────────────────────────────────────────────────────────
 
 
-def ytdlp_args(proxy_url: str, cookies: Path | None) -> list[str]:
+def ytdlp_args(
+    proxy_url: str,
+    cookies: Path | None,
+    *,
+    max_duration: float = MAX_DURATION_SECONDS,
+    max_filesize: str = MAX_FILESIZE,
+) -> list[str]:
+    """Common yt-dlp options. The limits default to the direct (short-video)
+    path; the v2 worker passes its own, larger ones."""
     args = [
         "--ignore-config",
         "--no-cache-dir",
         "--proxy", proxy_url,
         "--socket-timeout", "30",
-        "--max-filesize", MAX_FILESIZE,
-        "--match-filter", f"duration <=? {MAX_DURATION_SECONDS} & !is_live",
+        "--max-filesize", max_filesize,
+        "--match-filter", f"duration <=? {max_duration:g} & !is_live",
         "--downloader-args", f"ffmpeg_i:-protocol_whitelist {FFMPEG_INPUT_WHITELIST}",
     ]
     if cookies is not None:
