@@ -387,7 +387,12 @@ Para voltar atrás, restaure o backup do config e reinicie o Claude Desktop. O `
 .venv\Scripts\python -m pytest -q                                                     # unitários (worker, fila, caixa de entrada, busca)
 .venv\Scripts\python tests\e2e\e2e_v2_long.py --work <pasta-temp> --restart-at-chunk 3  # vídeo sintético longo + retomada
 .venv\Scripts\python tests\e2e\e2e_mcp_stdio.py --entry v2 --url <reel> --out <pasta-temp>   # compatibilidade com reels
+.venv\Scripts\python tests\e2e\e2e_v2_inbox.py --out <pasta-temp>                     # ataques à caixa de entrada
+.venv\Scripts\python tests\e2e\e2e_v2_symlink.py                                      # symlink numa caixa de entrada Linux temporária
+.venv\Scripts\python tests\e2e\e2e_v2_url.py --url <URL longa> --query <palavra> --out <pasta-temp>
 ```
+
+Resultados e detalhes: seção "v2 — end-to-end results" do [NOTES-mcp.md](NOTES-mcp.md).
 
 ## Structure
 
