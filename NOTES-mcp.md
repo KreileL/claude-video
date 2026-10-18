@@ -726,3 +726,11 @@ Known limitations, accepted:
 - Docker (project watch-mcp): new `watch-mcp-whisper-v2`, `watch-mcp-worker`, volume `watch-mcp-jobs`, image `watch-mcp:v2`; `watch-mcp:latest` untouched (600e77791f74). Benchmark models added to `watch-mcp-models` (turbo, large-v3, the two converted pt models, Kokoro int8, Piper edresson).
 - Outside the repo and the project: only the Desktop config (backup above). Test files placed in D:\Inbox were removed.
 - First real use: put the `.mkv` in `D:\Inbox`, restart Claude Desktop, then in the chat: list_inbox → analyze_video("<nome>.mkv") → job_status → search_transcript / watch_video(job_id=…).
+
+## v2 — promotion (2026-10-18, on request)
+
+- Claude Desktop: backup `%APPDATA%\Claude\claude_desktop_config.backup-20261018-094225.json`; `mcpServers["watch"]` now holds exactly the former `watch-v2` entry (image `watch-mcp:v2`, `watch-whisper-v2`, jobs volume, read-only `D:/Inbox`), and `watch-v2` was removed so the tools are not listed twice. `filesystem`, `MCP_DOCKER` and the other keys compared equal to the backup; the file parses with `ConvertFrom-Json`. Claude Desktop was not restarted.
+- Smoke test spawning the config's `watch` entry as written: server `watch` 0.3.0, protocol 2025-06-18, the seven tools, `list_inbox` and `list_jobs` answer.
+- Images: the v1 image also tagged `watch-mcp:v1` (600e77791f74); `watch-mcp:latest` still points at it, so nothing that names `latest` changed.
+- `watch-mcp-whisper` (v1) left running for rollback; nothing in the new entry uses it.
+- Rollback: restore the backup above and restart Claude Desktop.
