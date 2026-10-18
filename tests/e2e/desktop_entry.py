@@ -1,4 +1,4 @@
-"""The Claude Desktop "watch" and "watch-v2" server entries — single source of truth.
+"""The Claude Desktop "watch" server entries (v1, v2, v3) — single source of truth.
 
 Used by the end-to-end harness (so the protocol test spawns the container with
 exactly these arguments) and by install_desktop_config.py.
@@ -17,6 +17,8 @@ IMAGE_V2 = "watch-mcp:v2"
 WHISPER_URL_V2 = "http://watch-whisper-v2:8000/v1/audio/transcriptions"
 WHISPER_MODEL_V2 = "Systran/faster-whisper-small"
 JOBS_VOLUME = "watch-mcp-jobs"
+# v3: same server mounts as v2 (the vault is mounted only into watch-worker-v3).
+IMAGE_V3 = "watch-mcp:v3"
 INBOX_DIR = "D:/Inbox"
 # Claude Desktop starts MCP servers with only PATH plus this block; docker.exe
 # needs these to find its config and named pipe.
@@ -62,6 +64,15 @@ def docker_args_v2(home: Path | None = None, extra_env: dict[str, str] | None = 
     ])
 
 
+def docker_args_v3(home: Path | None = None, extra_env: dict[str, str] | None = None, *,
+                   jobs_volume: str = JOBS_VOLUME) -> list[str]:
+    # jobs_volume: end-to-end tests point the server at a throwaway volume.
+    return _args(home, extra_env, image=IMAGE_V3, model=WHISPER_MODEL_V2, whisper_url=WHISPER_URL_V2, mounts=[
+        f"type=volume,src={jobs_volume},dst=/jobs",
+        f"type=bind,src={INBOX_DIR},dst=/inbox,readonly",
+    ])
+
+
 def _env(environ: dict[str, str] | None) -> dict[str, str]:
     # Windows env names are case-insensitive and os.environ upper-cases them
     # (SYSTEMROOT), so match without case and write the conventional spelling.
@@ -75,3 +86,8 @@ def entry(home: Path | None = None, environ: dict[str, str] | None = None) -> di
 
 def entry_v2(home: Path | None = None, environ: dict[str, str] | None = None) -> dict:
     return {"command": "docker", "args": docker_args_v2(home), "env": _env(environ)}
+
+
+def entry_v3(home: Path | None = None, environ: dict[str, str] | None = None, *,
+             jobs_volume: str = JOBS_VOLUME) -> dict:
+    return {"command": "docker", "args": docker_args_v3(home, jobs_volume=jobs_volume), "env": _env(environ)}

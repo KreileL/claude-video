@@ -59,7 +59,7 @@ MAX_JOBS_BYTES = int(os.environ.get("WATCH_JOBS_MAX_BYTES", str(20 * 1024**3)))
 CHUNK_SECONDS = float(os.environ.get("WATCH_CHUNK_SECONDS", "300"))
 POLL_SECONDS = float(os.environ.get("WATCH_WORKER_POLL", "2"))
 CLEANUP_EVERY = 600.0
-RETRY_EVERY = 60.0  # v3: pending notes/summaries
+RETRY_EVERY = float(os.environ.get("WATCH_RETRY_EVERY", "60"))  # v3: pending notes/summaries
 BOOT_ID = os.urandom(8).hex()  # tells this process's heartbeat from another worker's
 OTHER_WORKER_STALE = 45.0
 # Chosen by the pt-BR benchmark (NOTES-mcp.md, "v2"); overridable per deployment.

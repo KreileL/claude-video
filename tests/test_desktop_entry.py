@@ -41,3 +41,11 @@ def test_v2_entry_uses_its_image_whisper_and_mounts():
 def test_env_block_matches_names_case_insensitively():
     env = desktop_entry.entry_v2(HOME, {"SYSTEMROOT": "C:\\Windows", "USERPROFILE": "x", "PATH": "p"})["env"]
     assert env == {"SystemRoot": "C:\\Windows", "USERPROFILE": "x"}
+
+
+def test_v3_entry_is_v2_with_the_v3_image_and_never_the_vault():
+    v2, v3 = desktop_entry.docker_args_v2(HOME), desktop_entry.docker_args_v3(HOME)
+    assert v3[-1] == "watch-mcp:v3" and v3[:-1] == v2[:-1]
+    assert not any("Obsidian" in a or "/entrada" in a or "Entrada" in a for a in v3)
+    test = desktop_entry.docker_args_v3(HOME, jobs_volume="watch-mcp-v3test-jobs")
+    assert "type=volume,src=watch-mcp-v3test-jobs,dst=/jobs" in test

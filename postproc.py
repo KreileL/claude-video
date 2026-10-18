@@ -28,9 +28,12 @@ import resumo
 RESUMO_CAIXA_ENTRADA = os.environ.get("WATCH_RESUMO_CAIXA_ENTRADA", "1").strip().lower() not in ("0", "false", "nao", "não", "off")
 UTC_OFFSET = timezone(timedelta(hours=float(os.environ.get("WATCH_UTC_OFFSET_HOURS", "-3"))))
 SUMMARY_TIMEOUT = float(os.environ.get("WATCH_RESUMO_JOB_TIMEOUT", "900"))
-RETRY_FIRST, RETRY_MAX = 300.0, 6 * 3600.0  # transient summary failures: 5 min, doubling, up to 6 h
+# Transient summary failures: 5 min, doubling, up to 6 h (env only to shorten end-to-end tests).
+RETRY_FIRST = float(os.environ.get("WATCH_RESUMO_RETRY_FIRST", "300"))
+RETRY_MAX = 6 * 3600.0
 PERMANENT_TRIES = 3  # a non-transient summary error is retried this many times, then "erro"
-EXPORT_RETRY, EXPORT_RETRY_MAX = 300.0, 3600.0
+EXPORT_RETRY = float(os.environ.get("WATCH_EXPORT_RETRY_FIRST", "300"))
+EXPORT_RETRY_MAX = 3600.0
 LOCK_NAME = ".export.lock"
 LOCK_STALE = 3600.0
 SUMMARY_FILE = "summary.json"
