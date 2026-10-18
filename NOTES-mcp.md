@@ -421,3 +421,55 @@ job instead of a new one.
   - **Prevention:** the runner never unloads explicitly. It waits for the
     120 s TTL to empty `/api/ps`. Neither the MCP server nor the worker ever
     calls `/api/ps`.
+
+## Codex counter-review (v2)
+
+- **Procedure:** the one that worked in Phase 5. The worktree was pre-created
+  as `.codex/worktrees/contraprova-v2`, detached at the commit under review
+  (f028d14). The command is the one from the brief:
+  ```
+  codex exec -m gpt-6.1-sol -c model_reasoning_effort="high" --disable unified_exec
+    -s workspace-write -c approval_policy="never"
+    -c sandbox_workspace_write.network_access=false
+    -C .codex/worktrees/contraprova-v2 -o .codex/review-mcp-v2.md "<prompt>"
+  ```
+  The prompt starts with an operator note about the worktree and asks for the
+  brief's focus, three rounds, reproduction of every claim, separate lists and
+  "Fora do diff". No danger-full-access.
+- **Parallel run:** Codex ran while the benchmark used Docker. Its review
+  covers the code before the benchmark's model choice; that later change is
+  configuration only.
+- **What Codex ran:** the existing suite (394 passed) plus 22 reproduction
+  tests of its own, in `.codex/worktrees/contraprova-v2/.codex-repro/`
+  (git-ignored).
+
+Verdict: "não promover ainda" — 6 blocking, 5 non-blocking, many confirmed. All fixed in 14fdc34, each with a
+regression test adapted from Codex's reproduction (`tests/test_v2_counter_review.py`, 18 tests):
+
+| # | Finding | Fix |
+|---|---|---|
+| B1 | A cookie value the site echoes into title/description was written to meta.json/job.json and served | display fields are redacted with the jar's values before anything is persisted |
+| B2 | `WATCH_JOBS_MAX_BYTES` was only checked once, before audio/index, after the download | room check (evicting finished jobs first) before download, audio and index; proxy budget = min(download cap, room); ffmpeg `-fs` on the audio |
+| B3 | The job deadline did not cover Whisper (health wait, request, retries); a late reply still finished the job | `whisper.py` takes a `deadline` for every attempt and backoff; the worker passes the remaining time and fails a reply that lands after it; ffprobe gets the remaining time |
+| B4 | A resume after the inbox file was replaced mixed old audio with new frames | source identity (size, mtime, duration) stored at first open, compared on resume and against the fingerprint the server saw |
+| B5 | The `-frames:v` cap stopped the index before the end of scene-heavy videos | grid frames always; scene cuts only ≥ grid/2 after the previous frame, so the total is bounded by spacing and the index always reaches the end |
+| B6 | A job.json with wrong types (`"started": "broken"`) crashed the worker in a loop | job.json validated before use; the main loop marks any job that raises as failed |
+| N1 | A job dir or `frames/` that is a link (junction) could serve another job's frame | links refused for the job dir, job.json and frames/ |
+| N2 | No overall text budget (5.8 M chars with a synthetic transcript) | search capped at 40 k chars (500 per hit), titles 300, inbox listing 200 entries |
+| N3 | A corrupt chunk file was skipped silently | only a valid chunk counts as done; a corrupt one is transcribed again |
+| N4 | A restart between index and video deletion kept the video during transcription | the cleanup runs on every pass |
+| N5 | The download budget restarts on each attempt | kept and documented: per attempt, ≤ 3 attempts, and B2's room check bounds the disk |
+
+Confirmed by Codex:
+- inbox name validation;
+- refusal of disguised content (text/HLS/ffconcat as media);
+- unguessable job_id validated before any path is built;
+- normal queue and retention behaviour;
+- chunk-level resume;
+- pt-BR request fields;
+- the image budget;
+- every v1 control it could run;
+- the v1 Desktop entry identical to mcp-local's;
+- container flags, by inspection.
+
+"Fora do diff": nothing new.
