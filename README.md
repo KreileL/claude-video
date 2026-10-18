@@ -225,7 +225,7 @@ Na primeira vez, baixe os modelos pela API do próprio serviço:
 docker exec watch-mcp-whisper curl -s -X POST http://localhost:8000/v1/models/Systran/faster-whisper-small
 ```
 
-A entrada `watch` em `%APPDATA%\Claude\claude_desktop_config.json` roda o `docker run` com `--network watch-mcp-net --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges --memory 2g --pids-limit 256`, sem portas publicadas (o gerador está em `tests/e2e/desktop_entry.py`). Reinicie o Claude Desktop depois de mudar a configuração.
+A entrada `watch` em `%APPDATA%\Claude\claude_desktop_config.json` roda o `docker run` com `--network watch-mcp-net --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges --memory 2g --pids-limit 256 --cpus 4`, sem portas publicadas (o gerador está em `tests/e2e/desktop_entry.py`). Reinicie o Claude Desktop depois de mudar a configuração.
 
 ### Ferramentas
 
@@ -261,7 +261,16 @@ O padrão é `Systran/faster-whisper-small`, porque o `medium` transcreve melhor
 
 ### Segurança
 
-Só URLs `http`/`https` para endereços públicos são aceitas. Todo acesso do yt-dlp passa por um proxy local (`netguard.py`) que confere de novo cada destino, inclusive redirecionamentos e CDNs, e conecta no IP já verificado, o que impede DNS rebinding. O vídeo pode ter até 15 min, até 500 MB de download e 1 GB de área temporária, e cada chamada tem tempo limite. A variável `WATCH_MCP_TEST_ALLOW_HOSTS` existe só para os testes de ponta a ponta e fica vazia por padrão. Detalhes e decisões estão em [NOTES-mcp.md](NOTES-mcp.md).
+Só URLs `http`/`https` para endereços públicos são aceitas. Todo acesso do yt-dlp passa por um proxy local (`netguard.py`) que confere de novo cada destino, inclusive redirecionamentos e CDNs, e conecta no IP já verificado, o que impede DNS rebinding. Quando o yt-dlp delega o download ao ffmpeg, só protocolos que passam pelo proxy são aceitos. Os frames devolvidos são só os JPEGs gerados na pasta da própria chamada, e valores de cookies nunca aparecem em erros nem na saída.
+
+Limites por chamada:
+
+- **Duração:** 15 min, verificados antes do download quando o site informa a duração. O Instagram nem sempre informa; aí valem os outros limites.
+- **Download:** 500 MB no total, com teto rígido contado pelo proxy (não depende do `Content-Length`).
+- **Área temporária:** 1 GB.
+- **Tempo:** 15 min por chamada, no total.
+
+A variável `WATCH_MCP_TEST_ALLOW_HOSTS` existe só para os testes de ponta a ponta e fica vazia por padrão. Detalhes e decisões estão em [NOTES-mcp.md](NOTES-mcp.md).
 
 ### Testes de ponta a ponta
 
