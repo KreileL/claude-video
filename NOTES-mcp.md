@@ -734,3 +734,11 @@ Known limitations, accepted:
 - Images: the v1 image also tagged `watch-mcp:v1` (600e77791f74); `watch-mcp:latest` still points at it, so nothing that names `latest` changed.
 - `watch-mcp-whisper` (v1) left running for rollback; nothing in the new entry uses it.
 - Rollback: restore the backup above and restart Claude Desktop.
+
+## Rollback para a v1
+
+1. Restaure `%APPDATA%\Claude\claude_desktop_config.backup-20261018-094225.json` sobre `%APPDATA%\Claude\claude_desktop_config.json`.
+2. `docker start watch-mcp-whisper` (o Whisper da v1 está parado, não removido).
+3. Reinicie o Claude Desktop.
+
+Código da v1: tag `v1-mcp` (16dc2ed). Imagem: `watch-mcp:latest`, também marcada como `watch-mcp:v1` (600e77791f74).
