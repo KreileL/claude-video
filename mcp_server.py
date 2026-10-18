@@ -106,7 +106,7 @@ QUERY_MAX_LEN = 200
 
 mcp = MCPServer(
     "watch",
-    version="0.3.0",
+    version="0.4.0",
     instructions=(
         "Tools to watch videos. Short videos from a URL (Instagram, TikTok, YouTube, ...): "
         "watch_video(url=...) returns metadata, a timestamped transcript and frames; "
@@ -114,7 +114,9 @@ mcp = MCPServer(
         "(list_inbox): analyze_video(source) starts a background job and returns a job_id at once; "
         "poll job_status(job_id), then search_transcript(job_id, query) to find moments and "
         "watch_video(job_id=..., start=..., end=...) for frames and the transcript of a range. "
-        "list_jobs() shows recent jobs."
+        "list_jobs() shows recent jobs. Every finished job also becomes a note (summary, "
+        "transcript, key frames) in the Holocron's \"00 - Entrada\" folder and stays archived, "
+        "so archived jobs can be searched and watched again at any time."
     ),
 )
 
