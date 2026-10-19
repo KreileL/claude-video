@@ -818,3 +818,48 @@ Reports: `.codex/review-mcp-v3-pass{1..5}.md` (not versioned). Every fix has a r
 - Test stack stopped, not removed: `watch-mcp-v3test-telegram2` and `watch-mcp-v3test-telegram` (removal refused by the permission classifier); the test worker was removed by the final e2e run. Throwaway volume `watch-mcp-v3test-jobs` kept (the user decides).
 - In the vault, besides the film note: the notes of acceptance 2 and 3, plus the incident's three re-created test folders and two redundant `Resumo.md` (left for the user).
 - Promotion steps when decided: README "MCP local v3" → "Subir"; Desktop entry from `entry_v3()`; then merge `mcp-v3` → `mcp-local` (ff-only), tag `v3-mcp`, release text in `RELEASE-v3.md`.
+
+## v3 — adjustments before promotion (user's requests)
+
+| Request | What changed | Verified |
+|---|---|---|
+| Automatic language in the MCP too | `analyze_video`, `watch_video`, `transcribe_video`: `language="auto"` by default (explicit code overrides; revises the v2 decision). Worker: 3 samples of 30 s (20/50/80 %), majority of the samples with speech (`decide_language`), persisted (`language_detected`, `language_votes`). Brazilian prompt only when the decided language is `pt`. Short path: `WATCH_WHISPER_LANGUAGE` only when explicit. | Over MCP, no `language`: the English reel (original link with `dlrf`) → votes `en,en,en`, English transcript; a pt-BR video (`youtu.be/…?si=…`) → `pt,pt,pt`, no prompt (no terms). `watch_video(url)` on the reel → English; `transcribe_video` on a pt-BR video → pt. Unit: majority/tie/silence, prompt gating per language, explicit skips detection, resume does not detect again. |
+| Separate secrets | `telegram-bot-token.txt` and `gemini-api-key.txt` moved (not read) to `%USERPROFILE%\.config\watch\secrets-v3\`; compose secrets point there (`WATCH_SECRETS_V3_DIR`). `cookies.txt` stays in `secrets\`, so the worker's `/secrets` bind shows only it and the v2 rollback keeps working. | `docker compose config`: secrets resolve to `secrets-v3`; v1/v2 service hashes unchanged. |
+| Bot formatting | `parse_mode: HTML`, ID in `<code>`, dynamic text through `html.escape`; on HTTP 400 the same text is resent plain. | Unit tests (escaping of `<script>&`, fallback). |
+| Clean URL | `urlclean.clean_url` in `check_url`, final form after Codex passes 6–7: only Instagram, YouTube and TikTok links are touched; known formats (reel/post/tv, TikTok video and its short links `vm.`/`vt.`/`/t/`/`tiktokv.com`, `youtu.be/<id>`, `/shorts/<id>`) lose their whole query; `youtube.com/watch` keeps only `v`, `list`, `index`; other pages of those platforms lose only tracking names; any other site is returned byte for byte; kept pieces are never re-encoded, empty pieces included. Applies to job.json, the cache key (two share links of one video reuse the job) and the note. | The acceptance links: reel `?dlrf=…` → `…/reel/DeX7nFXC_Hm/`; `youtu.be/…?si=…` → `youtu.be/x5SrLM1xJ3A`; `watch?v=…&pp=…` → `watch?v=…`. |
+| "Sem fala no áudio" | Short path: "Whisper returned no transcript segments" → "Sem fala no áudio." (no failure warning; `transcribe_video` returns text). Worker: `speech: false`; `job_status`/`watch_video(job_id)` say it; note `resumo: sem-fala` without calling the provider. "Falhou" only for real errors. | A 40 s silent video through the inbox: status "Transcrição: sem fala no áudio", note callout "Sem fala no áudio", no Gemini call. Test file removed from D:\Inbox. |
+| Vault cleanup | The 5 incident items removed after the user saw the exact paths and after checking that the 88d76a and 30a0a4 index notes have `resumo: ok` and the summary in the body. | Listing shown to the user. |
+
+Found on the way: `urlclean.py` was missing from the Dockerfile `COPY` (the Linux suite mounts the whole repo, so only the end-to-end run caught it). Fixed, plus `tests/test_dockerfile.py`, which fails if any local module imported by an entrypoint is not copied.
+
+
+### Codex on the adjustments (passes 6–9)
+
+| Pass | Blocking | Findings → fixes |
+|---|---|---|
+| 6 | 2 (+3 minor) | URL cleaning dropped content-selecting names (`source`, `checksum`…) on any site, re-encoded the query (signed URLs 200 → 403) and lost a YouTube live's `channel` → platform-only, known formats only, verbatim pieces. "No speech" could be a real error (a body quoting the phrase; `{"error"}` with HTTP 200) → `require_transcription`, exact status line. Minor: `auto` inheriting `WATCH_WHISPER_LANGUAGE`, partial failure + silent rest, short language map → fixed. First launch aborted on "model at capacity" (OpenAI side); relaunched once. |
+| 7 | 2 residual | Empty query pieces dropped (`&&`, trailing `&`) → other sites untouched, empty pieces kept; TikTok `/t/` and `tiktokv.com` added. `{"text": null}` and similar typed-wrong keys read as silence; a multi-line error body could carry the exact status line → types validated, error detail on one line, any real failure line cancels "no speech". |
+| 8 | 1 residual | Segments with non-string `text` (e.g. `{"text": null, "error": …}`) were dropped as empty → every segment needs a string `text` and no `error`. |
+| 9 | **0** | "No blocking issue left for promotion in this use." Suggested improvements: a structured silence signal instead of parsing watch.py's stderr; more permanent counter-tests. |
+
+Reports: `.codex/review-mcp-v3-pass6.md` … `pass9.md` (not versioned).
+
+Final suites: Windows 647 passed / 15 skipped (POSIX-only); Linux in `watch-mcp:v3` **662 passed, 0 skipped**. Final real run with the final image (throwaway volume): pt-BR video via `watch?v=…&pp=…` → origin stored as `watch?v=9TdxDghfUEw`, votes `pt,pt,pt`, summary ok, 10 frames.
+
+## v3 — promotion (2026-10-18, on request)
+
+- Claude Desktop: backup `%APPDATA%\Claude\claude_desktop_config.backup-20261018-210101.json`; `mcpServers["watch"]` = `entry_v3()` (only the image differs from the v2 entry: `watch-mcp:v3`); `filesystem`, `MCP_DOCKER` and every other key equal to the backup; `ConvertFrom-Json` ok. **Claude Desktop not restarted** (the user does it).
+- Smoke test spawning the config's `watch` entry as written: server `watch` 0.4.0, protocol 2025-06-18, the seven tools; `list_jobs` shows the film as "arquivado" with its note folder.
+- Docker: `docker stop watch-mcp-worker` (v2, stopped, not removed); `docker compose -p watch-mcp --profile v3 up -d --no-build watch-worker-v3 watch-telegram`. The v3 worker waited for v2's heartbeat to go stale, then started with `entrada=/entrada (ok)`. No ports; restart `unless-stopped`; v1/v2 compose hashes unchanged.
+- Isolation checked by listing: worker `/secrets` = `cookies.txt` only, `/run/secrets` = `gemini_api_key`; bot `/run/secrets` = `telegram_bot_token`, no cookies, no vault.
+- Real volume after start: the film untouched (no extra `Resumo.md`), the pre-v3 `done` jobs not exported, `00 - Entrada` unchanged.
+- Git: `mcp-v3` → `mcp-local` (fast-forward), tag `v3-mcp`, pushed. Release text in `RELEASE-v3.md` (not versioned; the GitHub CLI is not installed).
+- Left for the user: stopped test containers `watch-mcp-v3test-telegram` and `watch-mcp-v3test-telegram2`, throwaway volumes `watch-mcp-v3test-jobs`, `-jobs2`, `-jobs3`.
+
+### Rollback to v2
+
+1. `docker compose -p watch-mcp --profile v3 stop watch-worker-v3 watch-telegram`
+2. `docker start watch-mcp-worker`
+3. Restore `%APPDATA%\Claude\claude_desktop_config.backup-20261018-210101.json` and restart Claude Desktop.
+
+Archived jobs stay protected under v2 (its cleanup only deletes `done`/`failed`). Code of v2: tag `v2-mcp`.
